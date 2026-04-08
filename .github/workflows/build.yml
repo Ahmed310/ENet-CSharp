@@ -41,17 +41,11 @@ jobs:
             -DENET_SHARED=true
           cmake --build build-linux --config Release
 
-      - name: Rename to libenet.so
-        run: |
-          cd build-linux
-          # find whatever .so was produced and rename it
-          find . -name "*.so" | xargs -I{} cp {} libenet.so
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-linux-x64
-          path: build-linux/libenet.so
+          path: build-linux/*.so
 
   # ── Native library: Windows ───────────────────────────────────────────────
   build-windows:
@@ -68,17 +62,11 @@ jobs:
             -DENET_SHARED=true
           cmake --build build-windows --config Release
 
-      - name: Rename to enet.dll
-        shell: pwsh
-        run: |
-          $dll = Get-ChildItem -Path build-windows/Release -Filter "*.dll" | Select-Object -First 1
-          Copy-Item $dll.FullName -Destination "build-windows/Release/enet.dll"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-windows-x64
-          path: build-windows/Release/enet.dll
+          path: build-windows/Release/*.dll
 
   # ── Native library: macOS ─────────────────────────────────────────────────
   build-macos:
@@ -100,16 +88,11 @@ jobs:
             -DENET_SHARED=true
           cmake --build build-macos --config Release
 
-      - name: Rename to libenet.dylib
-        run: |
-          cd build-macos
-          find . -name "*.dylib" | xargs -I{} cp {} libenet.dylib
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-macos-x64
-          path: build-macos/libenet.dylib
+          path: build-macos/*.dylib
 
   # ── Android (arm64-v8a, armeabi-v7a, x86) ────────────────────────────────
   build-android:
@@ -172,15 +155,11 @@ jobs:
       - name: Build C# project
         run: dotnet build Source/Managed/ENet-CSharp.csproj -c Release
 
-      - name: Rename to ENet-CSharp.dll
-        run: |
-          find Source/Managed/bin/Release -name "*.dll" | xargs -I{} cp {} Source/Managed/bin/Release/ENet-CSharp.dll
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-csharp-assembly
-          path: Source/Managed/bin/Release/ENet-CSharp.dll
+          path: Source/Managed/bin/Release/**/*.dll
 
   # ── Bundle everything (only when building all) ────────────────────────────
   package:
