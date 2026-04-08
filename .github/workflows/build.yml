@@ -36,7 +36,8 @@ jobs:
       - name: Configure & build
         run: |
           cmake -S Source/Native -B build-linux \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build-linux --config Release
 
       - name: Upload artifact
@@ -55,7 +56,7 @@ jobs:
 
       - name: Configure & build
         run: |
-          cmake -S Source/Native -B build-windows -A x64
+          cmake -S Source/Native -B build-windows -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build-windows --config Release
 
       - name: Upload artifact
@@ -79,7 +80,8 @@ jobs:
         run: |
           cmake -S Source/Native -B build-macos \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build-macos --config Release
 
       - name: Upload artifact
@@ -147,15 +149,13 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Build C# project
-        run: dotnet build Source -c Release
+        run: dotnet build Source/Managed/ENet-CSharp.csproj -c Release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-csharp-assembly
-          path: |
-            Source/**/bin/Release/**/*.dll
-            Source/**/bin/Release/**/*.nupkg
+          path: Source/Managed/bin/Release/**/*.dll
 
   # ── Bundle everything (only when building all) ────────────────────────────
   package:
