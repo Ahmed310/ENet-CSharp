@@ -1,0 +1,113 @@
+name: Build ENet-CSharp
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+
+  # ── Native library: Linux ──────────────────────────────────────────────────
+  build-linux:
+    name: Native – Linux (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Configure & build
+        run: |
+          cmake -S Source -B build-linux \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --config Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-linux-x64
+          path: build-linux/*.so
+
+  # ── Native library: Windows ───────────────────────────────────────────────
+  build-windows:
+    name: Native – Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & build
+        run: |
+          cmake -S Source -B build-windows -A x64
+          cmake --build build-windows --config Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-windows-x64
+          path: build-windows/Release/*.dll
+
+  # ── Native library: macOS ─────────────────────────────────────────────────
+  build-macos:
+    name: Native – macOS (x64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake
+        run: brew install cmake
+
+      - name: Configure & build
+        run: |
+          cmake -S Source -B build-macos \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
+          cmake --build build-macos --config Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-macos-x64
+          path: build-macos/*.dylib
+
+  # ── C# managed assembly ───────────────────────────────────────────────────
+  build-csharp:
+    name: Managed C# Assembly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build C# project
+        run: dotnet build Source -c Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-csharp-assembly
+          path: |
+            Source/**/bin/Release/**/*.dll
+            Source/**/bin/Release/**/*.nupkg
+
+  # ── Bundle everything together ────────────────────────────────────────────
+  package:
+    name: Bundle All Artifacts
+    needs: [build-linux, build-windows, build-macos, build-csharp]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-all-platforms
+          path: artifacts/
