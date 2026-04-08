@@ -149,18 +149,31 @@ jobs:
             NDK_PROJECT_PATH=. \
             NDK_APPLICATION_MK=jni/Application.mk \
             NDK_LIBS_OUT=libs \
+            NDK_OUT=obj \
             V=1
 
-      - name: Verify Android outputs
+      - name: Collect unstripped .so files from obj/local
+        # obj/local contains the full unstripped libs (~200KB) which Unity needs.
+        # libs/ contains stripped libs (~50KB) which are only for APK packaging.
         run: |
-          echo "=== Android outputs ==="
-          find Source/Native/libs -type f | sort
-          test -n "$(find Source/Native/libs -name "*.so" -print -quit)"
+          echo "=== obj/local structure ==="
+          find Source/Native/obj/local -type f | sort
+          echo ""
+          echo "=== Copying unstripped libs ==="
+          mkdir -p android-out/arm64-v8a
+          mkdir -p android-out/armeabi-v7a
+          mkdir -p android-out/x86_64
+          cp Source/Native/obj/local/arm64-v8a/libenet.so   android-out/arm64-v8a/libenet.so || true
+          cp Source/Native/obj/local/armeabi-v7a/libenet.so android-out/armeabi-v7a/libenet.so || true
+          cp Source/Native/obj/local/x86_64/libenet.so      android-out/x86_64/libenet.so || true
+          echo ""
+          echo "=== Final sizes (should be ~200KB for arm64-v8a) ==="
+          find android-out -name "*.so" | xargs ls -lh
 
       - name: Verify 16KB page alignment
         run: |
           LLVM_READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          find Source/Native/libs -name "*.so" | while read -r f; do
+          find android-out -name "*.so" | while read -r f; do
             echo ""
             echo "File: $f"
             "$LLVM_READELF" --program-headers "$f" | grep -E "LOAD|Align" || true
@@ -170,7 +183,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: enet-android
-          path: Source/Native/libs/
+          path: android-out/
           if-no-files-found: error
 
   build-ios:
