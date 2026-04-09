@@ -19,7 +19,6 @@ on:
           - macos
           - android
           - ios
-          - visionos
 
 jobs:
 
@@ -186,73 +185,55 @@ jobs:
           path: android-out/
           if-no-files-found: error
 
+  # ── iOS + visionOS + visionOS Simulator ───────────────────────────────────
+  # All three are built by the single build-ios.sh script which outputs:
+  #   Source/Native/build/ios/libenet.a        → iOS device (arm64)
+  #   Source/Native/build/xros/libenet.a       → visionOS device (arm64)
+  #   Source/Native/build/xrsim/libenet.a      → visionOS Simulator (arm64)
   build-ios:
-    name: Native - iOS
+    name: Native - iOS + visionOS + visionOS Simulator
     runs-on: macos-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'ios' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build with Xcode script
+      - name: Build with build-ios.sh
         run: |
           cd Source/Native
           sh build-ios.sh
 
-      - name: Verify output
+      - name: Verify all outputs
         run: |
-          ls -lh Source/Native/libenet.a
-          test -f Source/Native/libenet.a
+          echo "=== All outputs from build-ios.sh ==="
+          find Source/Native/build -type f | sort
+          echo ""
+          echo "=== Sizes ==="
+          find Source/Native/build -name "*.a" | xargs ls -lh
+          echo ""
+          echo "=== Checking all three targets exist ==="
+          test -f Source/Native/build/ios/libenet.a   && echo "✅ iOS device"        || echo "❌ iOS device MISSING"
+          test -f Source/Native/build/xros/libenet.a  && echo "✅ visionOS device"   || echo "❌ visionOS device MISSING"
+          test -f Source/Native/build/xrsim/libenet.a && echo "✅ visionOS Simulator"|| echo "❌ visionOS Simulator MISSING"
 
-      - name: Upload artifact
+      - name: Upload iOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-ios
-          path: Source/Native/libenet.a
+          path: Source/Native/build/ios/libenet.a
           if-no-files-found: error
 
-  build-visionos:
-    name: Native - visionOS (Vision Pro)
-    runs-on: macos-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'visionos' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build libenet.a for visionOS
-        run: |
-          set -euxo pipefail
-
-          SDK_PATH="$(xcrun --sdk xros --show-sdk-path)"
-          CLANG="$(xcrun --sdk xros --find clang)"
-          LIBTOOL="$(xcrun --find libtool)"
-
-          mkdir -p build-visionos/obj build-visionos/out
-
-          "$CLANG" \
-            -target arm64-apple-xros1.0 \
-            -isysroot "$SDK_PATH" \
-            -O2 \
-            -fPIC \
-            -I Source/Native \
-            -c Source/Native/enet.c \
-            -o build-visionos/obj/enet.o
-
-          "$LIBTOOL" -static \
-            -o build-visionos/out/libenet.a \
-            build-visionos/obj/enet.o
-
-      - name: Verify visionOS output
-        run: |
-          echo "=== visionOS outputs ==="
-          find build-visionos -type f | sort
-          ls -lh build-visionos/out/libenet.a
-          file build-visionos/out/libenet.a
-          test -f build-visionos/out/libenet.a
-
-      - name: Upload artifact
+      - name: Upload visionOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-visionos
-          path: build-visionos/out/libenet.a
+          path: Source/Native/build/xros/libenet.a
+          if-no-files-found: error
+
+      - name: Upload visionOS Simulator artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enet-visionos-simulator
+          path: Source/Native/build/xrsim/libenet.a
           if-no-files-found: error
 
   build-csharp:
@@ -291,7 +272,6 @@ jobs:
       - build-macos
       - build-android
       - build-ios
-      - build-visionos
       - build-csharp
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
