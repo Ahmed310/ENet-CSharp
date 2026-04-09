@@ -152,8 +152,6 @@ jobs:
             V=1
 
       - name: Collect unstripped .so files from obj/local
-        # obj/local contains the full unstripped libs (~200KB) which Unity needs.
-        # libs/ contains stripped libs (~50KB) which are only for APK packaging.
         run: |
           echo "=== obj/local structure ==="
           find Source/Native/obj/local -type f | sort
@@ -185,11 +183,6 @@ jobs:
           path: android-out/
           if-no-files-found: error
 
-  # ── iOS + visionOS + visionOS Simulator ───────────────────────────────────
-  # All three are built by the single build-ios.sh script which outputs:
-  #   Source/Native/build/ios/libenet.a        → iOS device (arm64)
-  #   Source/Native/build/xros/libenet.a       → visionOS device (arm64)
-  #   Source/Native/build/xrsim/libenet.a      → visionOS Simulator (arm64)
   build-ios:
     name: Native - iOS + visionOS + visionOS Simulator
     runs-on: macos-latest
@@ -211,9 +204,9 @@ jobs:
           find Source/Native/build -name "*.a" | xargs ls -lh
           echo ""
           echo "=== Checking all three targets exist ==="
-          test -f Source/Native/build/ios/libenet.a   && echo "✅ iOS device"        || echo "❌ iOS device MISSING"
-          test -f Source/Native/build/xros/libenet.a  && echo "✅ visionOS device"   || echo "❌ visionOS device MISSING"
-          test -f Source/Native/build/xrsim/libenet.a && echo "✅ visionOS Simulator"|| echo "❌ visionOS Simulator MISSING"
+          test -f Source/Native/build/ios/libenet.a           && echo "✅ iOS device" || echo "❌ iOS device MISSING"
+          test -f Source/Native/build/visionos/libenet.a      && echo "✅ visionOS device" || echo "❌ visionOS device MISSING"
+          test -f Source/Native/build/visionos-sim/libenet.a  && echo "✅ visionOS Simulator" || echo "❌ visionOS Simulator MISSING"
 
       - name: Upload iOS artifact
         uses: actions/upload-artifact@v4
@@ -226,14 +219,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: enet-visionos
-          path: Source/Native/build/xros/libenet.a
+          path: Source/Native/build/visionos/libenet.a
           if-no-files-found: error
 
       - name: Upload visionOS Simulator artifact
         uses: actions/upload-artifact@v4
         with:
           name: enet-visionos-simulator
-          path: Source/Native/build/xrsim/libenet.a
+          path: Source/Native/build/visionos-sim/libenet.a
           if-no-files-found: error
 
   build-csharp:
