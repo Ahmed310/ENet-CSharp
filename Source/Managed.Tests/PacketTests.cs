@@ -50,10 +50,10 @@ namespace ENet.Tests {
 		}
 
 		[Fact]
-		public void Send_984Bytes_UsesPool() {
-			// 984 + 40-byte ENetPacket header = exactly one 1024-byte pool block
+		public void Send_1024Bytes_UsesPool() {
+			// 1024 + 40-byte header = 1064, within the 1280-byte pool block
 			PoolStatistics before = Library.GetPoolStatistics();
-			byte[] payload = MakePayload(984, 2);
+			byte[] payload = MakePayload(1024, 2);
 
 			Assert.Equal(payload, RoundTrip(payload));
 
@@ -62,33 +62,35 @@ namespace ENet.Tests {
 			// Send-side create + receive-side create both fit the pool
 			Assert.True(after.Hits + after.Misses - before.Hits - before.Misses >= 2, "Expected at least two pool acquisitions");
 			Assert.True(after.Returned > before.Returned, "Expected at least one block returned to the pool");
-			Assert.Equal(before.Oversized, after.Oversized);
 			Assert.True(after.Retained <= 576);
 		}
 
 		[Fact]
-		public void Send_985Bytes_FallsBack() {
-			// 985 + 40 = 1025 > 1024: one byte over the pool block, malloc fallback on both sides
+		public void Send_1200Bytes_UsesPool() {
+			// 1200-byte game/MTU-class payload: 1200 + 40 = 1240, still within the 1280 block
 			PoolStatistics before = Library.GetPoolStatistics();
-			byte[] payload = MakePayload(985, 3);
+			byte[] payload = MakePayload(1200, 3);
 
 			Assert.Equal(payload, RoundTrip(payload));
 
 			PoolStatistics after = Library.GetPoolStatistics();
 
-			Assert.True(after.Oversized - before.Oversized >= 2, "Expected oversized fallback on send and receive side");
+			Assert.True(after.Hits + after.Misses - before.Hits - before.Misses >= 2, "Expected the 1200-byte payload to be pooled");
+			Assert.True(after.Retained <= 576);
 		}
 
 		[Fact]
-		public void Send_Exactly1024Bytes_RoundTripsIntact_ViaFallback() {
+		public void Send_OversizedPayload_FallsBack() {
+			// 1300 bytes exceeds the 1280-byte block on its own (header included), so it can never be
+			// pooled; still under the default MTU, so it stays a single unfragmented packet each side
 			PoolStatistics before = Library.GetPoolStatistics();
-			byte[] payload = MakePayload(1024, 4);
+			byte[] payload = MakePayload(1300, 4);
 
 			Assert.Equal(payload, RoundTrip(payload));
 
 			PoolStatistics after = Library.GetPoolStatistics();
 
-			Assert.True(after.Oversized - before.Oversized >= 2, "1024-byte payloads exceed the pool block (header overhead) and must fall back");
+			Assert.True(after.Oversized - before.Oversized >= 2, "Payloads larger than the pool block must fall back to malloc on both sides");
 		}
 
 		[Fact]

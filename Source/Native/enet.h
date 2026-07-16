@@ -1074,7 +1074,10 @@ extern "C" {
 =======================================================================
 */
 
-	#define ENET_POOL_BLOCK_SIZE   1024
+	/* Whole-block size: the ENetPacket header (~40 bytes on 64-bit) is co-allocated with the payload,
+	   so the pooled payload ceiling is ENET_POOL_BLOCK_SIZE - sizeof(ENetPacket) (~1240 on 64-bit).
+	   1280 comfortably covers game/MTU-class payloads (1024-1200); raise it to cover the full MTU. */
+	#define ENET_POOL_BLOCK_SIZE   1280
 	#define ENET_POOL_MAX_RETAINED 576
 
 	typedef struct _ENetPoolBlock {

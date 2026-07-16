@@ -72,6 +72,38 @@ Then install:
 dotnet add package ENet-CSharp --version 2.6.0
 ```
 
+### Consuming in CI (GitHub Actions)
+
+GitHub Packages requires authentication even for public repositories, so a CI job must add the feed with a token before restoring. If the consuming repository lives under the **same** owner (`Ahmed310`), the built-in `GITHUB_TOKEN` works once the job requests `packages: read`; from a different owner, use a classic PAT (with `read:packages`) stored as a secret:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read          # only needed for the same-owner GITHUB_TOKEN case
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Add ENet-CSharp GitHub Packages source
+        run: >
+          dotnet nuget add source "https://nuget.pkg.github.com/Ahmed310/index.json"
+          --name ahmed310
+          --username Ahmed310
+          --password "${{ secrets.GITHUB_TOKEN }}"
+          --store-password-in-clear-text
+        # cross-owner: replace secrets.GITHUB_TOKEN with a PAT secret, e.g. secrets.GH_PACKAGES_PAT
+
+      - run: dotnet restore
+      - run: dotnet build -c Release --no-restore
+```
+
+`--store-password-in-clear-text` is required on Linux/macOS runners because the encrypted credential store is unavailable there. A checked-in `nuget.config` with `packageSourceMapping` (as above) still applies, so `ENet-CSharp` resolves from this feed and everything else from nuget.org.
+
 Android, iOS, and visionOS native libraries are built by CI and published as workflow artifacts (`enet-all-platforms`) for manual placement in Unity projects.
 
 Supported OS versions:
@@ -83,8 +115,8 @@ Buffer pool
 --------
 The native library maintains a fixed-size pool of packet buffers to avoid per-packet heap allocation on the hot path:
 
-- Block size is 1024 bytes, holding the packet header plus up to 984 bytes of payload. Packets with larger payloads transparently fall back to the general allocator (including fragmented transfers of any size).
-- The pool retains at most 576 released blocks (~590 KB ceiling); there is no warm-up phase, blocks enter the pool as packets are destroyed.
+- Block size is 1280 bytes, holding the packet header plus roughly 1240 bytes of payload on 64-bit (the ceiling is the block size minus `sizeof(ENetPacket)`), which covers typical game/MTU-class packets. Packets with larger payloads transparently fall back to the general allocator (including fragmented transfers of any size). The block size is a single tunable constant (`ENET_POOL_BLOCK_SIZE`) if you need to cover the full MTU.
+- The pool retains at most 576 released blocks (~720 KB ceiling); there is no warm-up phase, blocks enter the pool as packets are destroyed.
 - Both the send path (`Packet.Create`) and the receive path draw from the same pool.
 - `ENet.Library.GetPoolStatistics()` exposes hits/misses/oversized/returned/retained counters, and `ENet.Library.DrainPool()` releases retained blocks.
 - Building the native library with `-DENET_NO_POOL` (compile definition `ENET_NO_POOL`) disables pooling entirely.
