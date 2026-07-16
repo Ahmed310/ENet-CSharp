@@ -37,7 +37,6 @@ jobs:
         run: |
           cmake -S Source/Native -B build-linux \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DENET_SHARED=true
           cmake --build build-linux --config Release
 
@@ -65,7 +64,6 @@ jobs:
         shell: pwsh
         run: |
           cmake -S Source/Native -B build-windows -A x64 `
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
             -DENET_SHARED=true
           cmake --build build-windows --config Release
 
@@ -95,7 +93,6 @@ jobs:
         run: |
           cmake -S Source/Native -B build-macos \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DENET_SHARED=true
           cmake --build build-macos --config Release
 
