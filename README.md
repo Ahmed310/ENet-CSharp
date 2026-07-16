@@ -519,16 +519,3 @@ Contains constant fields.
 `Library.Deinitialize()` deinitializes the native library. Should be called after the work is done.
 
 `Library.CRC64(IntPtr buffers, int bufferCount)` computes a checksum for unmanaged buffers.
-
-Supporters
---------
-This project is sponsored by:
-
-[Flying Squirrel Entertainment](https://www.fsegames.eu)<br/>
-<a href="https://www.fsegames.eu"><img src="https://i.imgur.com/i89ckRS.png" alt="Flying Squirrel Entertainment"></a>
-
-[Square Root Studios](https://titanreach.com)<br/>
-<a href="https://titanreach.com"><img src="https://i.imgur.com/LkC7sNv.png" alt="Square Root Studios"></a>
-
-[Strange Loop Games](https://play.eco)<br/>
-<a href="https://play.eco"><img src="https://i.imgur.com/v8MOgth.png" alt="Strange Loop Games"></a>
