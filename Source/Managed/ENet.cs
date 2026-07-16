@@ -24,6 +24,7 @@
  */
 
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
@@ -85,11 +86,17 @@ namespace ENet {
 		public NoMemoryCallback noMemory;
 	}
 
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate IntPtr AllocCallback(IntPtr size);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate void FreeCallback(IntPtr memory);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate void NoMemoryCallback();
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate void PacketFreeCallback(Packet packet);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate int InterceptCallback(ref Event @event, ref Address address, IntPtr receivedData, int receivedDataLength);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 	public delegate ulong ChecksumCallback(IntPtr buffers, int bufferCount);
 
 	internal static class ArrayPool {
@@ -244,6 +251,23 @@ namespace ENet {
 	public struct Packet : IDisposable {
 		private IntPtr nativePacket;
 
+		// Native holds only a function pointer; the delegate behind it must stay rooted or the GC
+		// collects it and the callback crashes. One static thunk is registered with native, and
+		// per-packet user callbacks are kept here until the packet is destroyed (single-threaded,
+		// like all packet operations).
+		private static readonly Dictionary<IntPtr, PacketFreeCallback> freeCallbacks = new Dictionary<IntPtr, PacketFreeCallback>();
+		private static readonly PacketFreeCallback freeCallbackThunk = OnNativePacketFree;
+		private static readonly IntPtr freeCallbackThunkPointer = Marshal.GetFunctionPointerForDelegate(freeCallbackThunk);
+
+		private static void OnNativePacketFree(Packet packet) {
+			PacketFreeCallback callback;
+
+			if (freeCallbacks.TryGetValue(packet.nativePacket, out callback)) {
+				freeCallbacks.Remove(packet.nativePacket);
+				callback(packet);
+			}
+		}
+
 		internal IntPtr NativeData {
 			get {
 				return nativePacket;
@@ -317,13 +341,20 @@ namespace ENet {
 		public void SetFreeCallback(IntPtr callback) {
 			ThrowIfNotCreated();
 
+			freeCallbacks.Remove(nativePacket);
+
 			Native.enet_packet_set_free_callback(nativePacket, callback);
 		}
 
 		public void SetFreeCallback(PacketFreeCallback callback) {
 			ThrowIfNotCreated();
 
-			Native.enet_packet_set_free_callback(nativePacket, Marshal.GetFunctionPointerForDelegate(callback));
+			if (callback == null)
+				throw new ArgumentNullException("callback");
+
+			freeCallbacks[nativePacket] = callback;
+
+			Native.enet_packet_set_free_callback(nativePacket, freeCallbackThunkPointer);
 		}
 
 		public void Create(byte[] data) {
@@ -348,7 +379,14 @@ namespace ENet {
 			if (length < 0 || length > data.Length)
 				throw new ArgumentOutOfRangeException("length");
 
+			// The array is only pinned for the duration of the call; native would keep a dangling pointer
+			if ((flags & PacketFlags.NoAllocate) != 0)
+				throw new ArgumentException("NoAllocate cannot be used with managed arrays, use the IntPtr overload with unmanaged memory instead", "flags");
+
 			nativePacket = Native.enet_packet_create(data, (IntPtr)length, flags);
+
+			if (nativePacket == IntPtr.Zero)
+				throw new InvalidOperationException("Packet creation failed");
 		}
 
 		public void Create(IntPtr data, int length, PacketFlags flags) {
@@ -359,44 +397,67 @@ namespace ENet {
 				throw new ArgumentOutOfRangeException("length");
 
 			nativePacket = Native.enet_packet_create(data, (IntPtr)length, flags);
+
+			if (nativePacket == IntPtr.Zero)
+				throw new InvalidOperationException("Packet creation failed");
 		}
 
 		public void Create(byte[] data, int offset, int length, PacketFlags flags) {
 			if (data == null)
 				throw new ArgumentNullException("data");
 
-			if (offset < 0)
+			if (offset < 0 || offset > length)
 				throw new ArgumentOutOfRangeException("offset");
 
 			if (length < 0 || length > data.Length)
 				throw new ArgumentOutOfRangeException("length");
 
+			if ((flags & PacketFlags.NoAllocate) != 0)
+				throw new ArgumentException("NoAllocate cannot be used with managed arrays, use the IntPtr overload with unmanaged memory instead", "flags");
+
 			nativePacket = Native.enet_packet_create_offset(data, (IntPtr)length, (IntPtr)offset, flags);
+
+			if (nativePacket == IntPtr.Zero)
+				throw new InvalidOperationException("Packet creation failed");
 		}
 
 		public void Create(IntPtr data, int offset, int length, PacketFlags flags) {
 			if (data == IntPtr.Zero)
 				throw new ArgumentNullException("data");
 
-			if (offset < 0)
+			if (offset < 0 || offset > length)
 				throw new ArgumentOutOfRangeException("offset");
 
 			if (length < 0)
 				throw new ArgumentOutOfRangeException("length");
 
 			nativePacket = Native.enet_packet_create_offset(data, (IntPtr)length, (IntPtr)offset, flags);
+
+			if (nativePacket == IntPtr.Zero)
+				throw new InvalidOperationException("Packet creation failed");
 		}
 
 		public void CopyTo(byte[] destination) {
 			if (destination == null)
 				throw new ArgumentNullException("destination");
 
-			Marshal.Copy(Data, destination, 0, Length);
+			int length = Length;
+
+			if (destination.Length < length)
+				throw new ArgumentOutOfRangeException("destination");
+
+			Marshal.Copy(Data, destination, 0, length);
 		}
 	}
 
 	public class Host : IDisposable {
 		private IntPtr nativeHost;
+		// Root the delegates passed to native so the GC cannot collect them while the host holds their
+		// function pointers. Field rooting only lasts as long as the Host is reachable, so every method
+		// that calls into the native host (where these callbacks fire synchronously) also does
+		// GC.KeepAlive(this) after the call to keep the Host - and thus these delegates - alive across it.
+		private InterceptCallback interceptCallback;
+		private ChecksumCallback checksumCallback;
 
 		internal IntPtr NativeData {
 			get {
@@ -540,6 +601,7 @@ namespace ENet {
 
 			packet.ThrowIfNotCreated();
 			Native.enet_host_broadcast(nativeHost, channelID, packet.NativeData);
+			GC.KeepAlive(this);
 			packet.NativeData = IntPtr.Zero;
 		}
 
@@ -548,6 +610,7 @@ namespace ENet {
 
 			packet.ThrowIfNotCreated();
 			Native.enet_host_broadcast_exclude(nativeHost, channelID, packet.NativeData, excludedPeer.NativeData);
+			GC.KeepAlive(this);
 			packet.NativeData = IntPtr.Zero;
 		}
 
@@ -571,6 +634,7 @@ namespace ENet {
 				}
 
 				Native.enet_host_broadcast_selective(nativeHost, channelID, packet.NativeData, nativePeers, (IntPtr)nativeCount);
+				GC.KeepAlive(this);
 				packet.NativeData = IntPtr.Zero;
 			} else {
 				packet.Dispose();
@@ -585,6 +649,7 @@ namespace ENet {
 			ENetEvent nativeEvent;
 
 			var result = Native.enet_host_check_events(nativeHost, out nativeEvent);
+			GC.KeepAlive(this);
 
 			if (result <= 0) {
 				@event = default(Event);
@@ -611,6 +676,7 @@ namespace ENet {
 
 			var nativeAddress = address.NativeData;
 			var peer = new Peer(Native.enet_host_connect(nativeHost, ref nativeAddress, (IntPtr)channelLimit, data));
+			GC.KeepAlive(this);
 
 			if (peer.NativeData == IntPtr.Zero)
 				throw new InvalidOperationException("Host connect call failed");
@@ -627,6 +693,7 @@ namespace ENet {
 			ENetEvent nativeEvent;
 
 			var result = Native.enet_host_service(nativeHost, out nativeEvent, (uint)timeout);
+			GC.KeepAlive(this);
 
 			if (result <= 0) {
 				@event = default(Event);
@@ -661,17 +728,26 @@ namespace ENet {
 		public void SetInterceptCallback(IntPtr callback) {
 			ThrowIfNotCreated();
 
+			interceptCallback = null;
+
 			Native.enet_host_set_intercept_callback(nativeHost, callback);
 		}
 
 		public void SetInterceptCallback(InterceptCallback callback) {
 			ThrowIfNotCreated();
 
-			Native.enet_host_set_intercept_callback(nativeHost, Marshal.GetFunctionPointerForDelegate(callback));
+			if (callback == null)
+				throw new ArgumentNullException("callback");
+
+			interceptCallback = callback;
+
+			Native.enet_host_set_intercept_callback(nativeHost, Marshal.GetFunctionPointerForDelegate(interceptCallback));
 		}
 
 		public void SetChecksumCallback(IntPtr callback) {
 			ThrowIfNotCreated();
+
+			checksumCallback = null;
 
 			Native.enet_host_set_checksum_callback(nativeHost, callback);
 		}
@@ -679,13 +755,19 @@ namespace ENet {
 		public void SetChecksumCallback(ChecksumCallback callback) {
 			ThrowIfNotCreated();
 
-			Native.enet_host_set_checksum_callback(nativeHost, Marshal.GetFunctionPointerForDelegate(callback));
+			if (callback == null)
+				throw new ArgumentNullException("callback");
+
+			checksumCallback = callback;
+
+			Native.enet_host_set_checksum_callback(nativeHost, Marshal.GetFunctionPointerForDelegate(checksumCallback));
 		}
 
 		public void Flush() {
 			ThrowIfNotCreated();
 
 			Native.enet_host_flush(nativeHost);
+			GC.KeepAlive(this);
 		}
 	}
 
@@ -944,7 +1026,7 @@ namespace ENet {
 		public const uint timeoutLimit = 32;
 		public const uint timeoutMinimum = 5000;
 		public const uint timeoutMaximum = 30000;
-		public const uint version = (2 << 16) | (5 << 8) | (3);
+		public const uint version = (2 << 16) | (6 << 8) | (0);
 
 		public static uint Time {
 			get {
@@ -966,6 +1048,10 @@ namespace ENet {
 			if (Native.enet_linked_version() != version)
 				throw new InvalidOperationException("Incompatible version");
 
+			// Rooted for the lifetime of the process: native keeps the function pointers, and the
+			// custom free can still run after Deinitialize when a held packet is disposed late
+			rootedCallbacks = callbacks;
+
 			ENetCallbacks nativeCallbacks = callbacks.NativeData;
 
 			return Native.enet_initialize_with_callbacks(version, ref nativeCallbacks) == 0;
@@ -978,6 +1064,28 @@ namespace ENet {
 		public static ulong CRC64(IntPtr buffers, int bufferCount) {
 			return Native.enet_crc64(buffers, bufferCount);
 		}
+
+		public static PoolStatistics GetPoolStatistics() {
+			PoolStatistics statistics = default(PoolStatistics);
+
+			Native.enet_pool_get_statistics(out statistics.Hits, out statistics.Misses, out statistics.Oversized, out statistics.Returned, out statistics.Retained);
+
+			return statistics;
+		}
+
+		public static void DrainPool() {
+			Native.enet_pool_drain();
+		}
+
+		private static Callbacks rootedCallbacks;
+	}
+
+	public struct PoolStatistics {
+		public ulong Hits;
+		public ulong Misses;
+		public ulong Oversized;
+		public ulong Returned;
+		public uint Retained;
 	}
 
 	[SuppressUnmanagedCodeSecurity]
@@ -1050,6 +1158,12 @@ namespace ENet {
 
 		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
 		internal static extern void enet_packet_dispose(IntPtr packet);
+
+		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
+		internal static extern void enet_pool_get_statistics(out ulong hits, out ulong misses, out ulong oversized, out ulong returned, out uint retained);
+
+		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
+		internal static extern void enet_pool_drain();
 
 		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
 		internal static extern IntPtr enet_host_create(ref ENetAddress address, IntPtr peerLimit, IntPtr channelLimit, uint incomingBandwidth, uint outgoingBandwidth, int bufferSize);

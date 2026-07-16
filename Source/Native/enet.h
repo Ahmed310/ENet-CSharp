@@ -30,8 +30,8 @@
 #include <time.h>
 
 #define ENET_VERSION_MAJOR 2
-#define ENET_VERSION_MINOR 5
-#define ENET_VERSION_PATCH 3
+#define ENET_VERSION_MINOR 6
+#define ENET_VERSION_PATCH 0
 #define ENET_VERSION_CREATE(major, minor, patch) (((major) << 16) | ((minor) << 8) | (patch))
 #define ENET_VERSION_GET_MAJOR(version) (((version) >> 16) & 0xFF)
 #define ENET_VERSION_GET_MINOR(version) (((version) >> 8) & 0xFF)
@@ -465,7 +465,8 @@ extern "C" {
 		ENET_PACKET_FLAG_UNRELIABLE_FRAGMENTED = (1 << 3),
 		ENET_PACKET_FLAG_INSTANT               = (1 << 4),
 		ENET_PACKET_FLAG_UNTHROTTLED           = (1 << 5),
-		ENET_PACKET_FLAG_SENT                  = (1 << 8)
+		ENET_PACKET_FLAG_SENT                  = (1 << 8),
+		ENET_PACKET_FLAG_POOLED                = (1 << 15) /* internal: block belongs to the shared buffer pool; stripped from caller-supplied flags */
 	} ENetPacketFlag;
 
 	typedef void (ENET_CALLBACK *ENetPacketFreeCallback)(void*);
@@ -756,6 +757,9 @@ extern "C" {
 	ENET_API void enet_packet_set_free_callback(ENetPacket*, ENetPacketFreeCallback);
 	ENET_API int enet_packet_check_references(const ENetPacket*);
 	ENET_API void enet_packet_dispose(ENetPacket*);
+
+	ENET_API void enet_pool_get_statistics(uint64_t* hits, uint64_t* misses, uint64_t* oversized, uint64_t* returned, uint32_t* retained);
+	ENET_API void enet_pool_drain(void);
 
 	ENET_API uint32_t enet_host_get_peers_count(const ENetHost*);
 	ENET_API uint32_t enet_host_get_packets_sent(const ENetHost*);
@@ -1056,6 +1060,121 @@ extern "C" {
 
 	void enet_free(void* memory) {
 		callbacks.free(memory);
+	}
+
+/*
+=======================================================================
+
+	Buffer pool
+
+	Fixed-size pool of whole packet blocks (ENetPacket header + payload
+	co-allocated, see enet_packet_create). Single-threaded, like the rest
+	of the library: all packet operations must happen on one thread.
+
+=======================================================================
+*/
+
+	#define ENET_POOL_BLOCK_SIZE   1024
+	#define ENET_POOL_MAX_RETAINED 576
+
+	typedef struct _ENetPoolBlock {
+		struct _ENetPoolBlock* next;
+	} ENetPoolBlock;
+
+	static ENetPoolBlock* enet_pool_free_list = NULL;
+	static uint32_t enet_pool_retained = 0;
+	static int enet_pool_enabled = 0;
+	static uint64_t enet_pool_stat_hits = 0;
+	static uint64_t enet_pool_stat_misses = 0;
+	static uint64_t enet_pool_stat_oversized = 0;
+	static uint64_t enet_pool_stat_returned = 0;
+
+#ifndef ENET_NO_POOL
+	static void* enet_pool_acquire(size_t size, int* pooled) {
+		void* block;
+
+		*pooled = 0;
+
+		if (!enet_pool_enabled)
+			return enet_malloc(size);
+
+		if (size > ENET_POOL_BLOCK_SIZE) {
+			++enet_pool_stat_oversized;
+
+			return enet_malloc(size);
+		}
+
+		if (enet_pool_free_list != NULL) {
+			block = enet_pool_free_list;
+			enet_pool_free_list = enet_pool_free_list->next;
+			--enet_pool_retained;
+			++enet_pool_stat_hits;
+			*pooled = 1;
+
+			return block;
+		}
+
+		++enet_pool_stat_misses;
+
+		/* No warm-up: a full-size block is allocated on demand and joins the pool when released */
+		block = enet_malloc(ENET_POOL_BLOCK_SIZE);
+
+		if (block != NULL)
+			*pooled = 1;
+
+		return block;
+	}
+
+	static void enet_pool_release(void* block) {
+		if (enet_pool_enabled && enet_pool_retained < ENET_POOL_MAX_RETAINED) {
+			((ENetPoolBlock*)block)->next = enet_pool_free_list;
+			enet_pool_free_list = (ENetPoolBlock*)block;
+			++enet_pool_retained;
+			++enet_pool_stat_returned;
+
+			return;
+		}
+
+		enet_free(block);
+	}
+#else
+	static void* enet_pool_acquire(size_t size, int* pooled) {
+		*pooled = 0;
+
+		return enet_malloc(size);
+	}
+
+	static void enet_pool_release(void* block) {
+		enet_free(block);
+	}
+#endif // ENET_NO_POOL
+
+	static void enet_pool_free_blocks(void) {
+		ENetPoolBlock* block = enet_pool_free_list;
+
+		enet_pool_free_list = NULL;
+		enet_pool_retained = 0;
+
+		while (block != NULL) {
+			ENetPoolBlock* next = block->next;
+
+			enet_free(block);
+
+			block = next;
+		}
+	}
+
+	static void enet_pool_startup(void) {
+		enet_pool_enabled = 1;
+		enet_pool_stat_hits = 0;
+		enet_pool_stat_misses = 0;
+		enet_pool_stat_oversized = 0;
+		enet_pool_stat_returned = 0;
+	}
+
+	static void enet_pool_shutdown(void) {
+		enet_pool_enabled = 0;
+		enet_pool_free_blocks();
 	}
 
 /*
@@ -1422,16 +1541,19 @@ extern "C" {
 
 	ENetPacket* enet_packet_create(const void* data, size_t dataLength, uint32_t flags) {
 		ENetPacket* packet;
+		int pooled;
+
+		flags &= ~(uint32_t)ENET_PACKET_FLAG_POOLED;
 
 		if (flags & ENET_PACKET_FLAG_NO_ALLOCATE) {
-			packet = (ENetPacket*)enet_malloc(sizeof(ENetPacket));
+			packet = (ENetPacket*)enet_pool_acquire(sizeof(ENetPacket), &pooled);
 
 			if (packet == NULL)
 				return NULL;
 
 			packet->data = (uint8_t*)data;
 		} else {
-			packet = (ENetPacket*)enet_malloc(sizeof(ENetPacket) + dataLength);
+			packet = (ENetPacket*)enet_pool_acquire(sizeof(ENetPacket) + dataLength, &pooled);
 
 			if (packet == NULL)
 				return NULL;
@@ -1441,6 +1563,9 @@ extern "C" {
 			if (data != NULL)
 				memcpy(packet->data, data, dataLength);
 		}
+
+		if (pooled)
+			flags |= ENET_PACKET_FLAG_POOLED;
 
 		packet->referenceCount = 0;
 		packet->flags = flags;
@@ -1453,16 +1578,22 @@ extern "C" {
 
 	ENetPacket* enet_packet_create_offset(const void* data, size_t dataLength, size_t dataOffset, uint32_t flags) {
 		ENetPacket* packet;
+		int pooled;
+
+		if (dataOffset > dataLength)
+			return NULL;
+
+		flags &= ~(uint32_t)ENET_PACKET_FLAG_POOLED;
 
 		if (flags & ENET_PACKET_FLAG_NO_ALLOCATE) {
-			packet = (ENetPacket*)enet_malloc(sizeof(ENetPacket));
+			packet = (ENetPacket*)enet_pool_acquire(sizeof(ENetPacket), &pooled);
 
 			if (packet == NULL)
 				return NULL;
 
 			packet->data = (uint8_t*)data;
 		} else {
-			packet = (ENetPacket*)enet_malloc(sizeof(ENetPacket) + dataLength - dataOffset);
+			packet = (ENetPacket*)enet_pool_acquire(sizeof(ENetPacket) + dataLength - dataOffset, &pooled);
 
 			if (packet == NULL)
 				return NULL;
@@ -1472,6 +1603,9 @@ extern "C" {
 			if (data != NULL)
 				memcpy(packet->data, (char*)data + dataOffset, dataLength - dataOffset);
 		}
+
+		if (pooled)
+			flags |= ENET_PACKET_FLAG_POOLED;
 
 		packet->referenceCount = 0;
 		packet->flags = flags;
@@ -1489,7 +1623,10 @@ extern "C" {
 		if (packet->freeCallback != NULL)
 			(*packet->freeCallback)((void*)packet);
 
-		enet_free(packet);
+		if (packet->flags & ENET_PACKET_FLAG_POOLED)
+			enet_pool_release(packet);
+		else
+			enet_free(packet);
 	}
 
 /*
@@ -4415,10 +4552,14 @@ extern "C" {
 
 	#ifndef _WIN32
 		int enet_initialize(void) {
+			enet_pool_startup();
+
 			return 0;
 		}
 
-		void enet_deinitialize(void) { }
+		void enet_deinitialize(void) {
+			enet_pool_shutdown();
+		}
 
 		uint64_t enet_host_random_seed(void) {
 			struct timeval timeVal;
@@ -4763,10 +4904,13 @@ extern "C" {
 
 			timeBeginPeriod(1);
 
+			enet_pool_startup();
+
 			return 0;
 		}
 
 		void enet_deinitialize(void) {
+			enet_pool_shutdown();
 			timeEndPeriod(1);
 			WSACleanup();
 		}
@@ -5084,6 +5228,27 @@ extern "C" {
 	void enet_packet_dispose(ENetPacket* packet) {
 		if (packet->referenceCount == 0)
 			enet_packet_destroy(packet);
+	}
+
+	void enet_pool_get_statistics(uint64_t* hits, uint64_t* misses, uint64_t* oversized, uint64_t* returned, uint32_t* retained) {
+		if (hits != NULL)
+			*hits = enet_pool_stat_hits;
+
+		if (misses != NULL)
+			*misses = enet_pool_stat_misses;
+
+		if (oversized != NULL)
+			*oversized = enet_pool_stat_oversized;
+
+		if (returned != NULL)
+			*returned = enet_pool_stat_returned;
+
+		if (retained != NULL)
+			*retained = enet_pool_retained;
+	}
+
+	void enet_pool_drain(void) {
+		enet_pool_free_blocks();
 	}
 
 	uint32_t enet_host_get_peers_count(const ENetHost* host) {

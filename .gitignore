@@ -1,2 +1,8 @@
 .DS_Store
 Source/Native/build
+Source/Managed/bin
+Source/Managed/obj
+Source/Managed/runtimes
+Source/Managed.Tests/bin
+Source/Managed.Tests/obj
+nupkg

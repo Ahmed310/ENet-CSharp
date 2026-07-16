@@ -2,9 +2,9 @@
   <img src="https://i.imgur.com/CxkUxTs.png" alt="alt logo">
 </p>
 
-[![GitHub release](https://img.shields.io/github/release/nxrighthere/ENet-CSharp.svg?style=flat-square)](https://github.com/nxrighthere/ENet-CSharp/releases) [![NuGet](https://img.shields.io/nuget/v/ENet-CSharp.svg?style=flat-square)](https://www.nuget.org/packages/ENet-CSharp/)
+[![GitHub release](https://img.shields.io/github/v/tag/Ahmed310/ENet-CSharp.svg?style=flat-square)](https://github.com/Ahmed310/ENet-CSharp/tags)
 
-This is an independent ENet implementation with a modified protocol for C, C++, C#, and other languages.
+This is an independent ENet implementation with a modified protocol for C, C++, C#, and other languages. This fork of [nxrighthere/ENet-CSharp](https://github.com/nxrighthere/ENet-CSharp) adds fixed-size native packet-buffer pooling, wrapper stability fixes, and distributes via GitHub Packages instead of nuget.org.
 
 Features:
 
@@ -32,24 +32,64 @@ For mobile platforms [NDK](https://developer.android.com/ndk/downloads/) for And
 
 To build the library for Nintendo Switch, follow [this](https://pastebin.com/raw/rbjLgMV2) guide.
 
-A managed assembly can be built using any available compiling platform that supports C# 3.0 or higher.
+The managed assembly builds with the .NET 10 SDK (`dotnet build Source/Managed/ENet-CSharp.csproj -c Release`) and targets `netstandard2.1` (Unity/Mono) and `net10.0`.
 
-Compiled libraries
+Tests live in `Source/Managed.Tests` and run with `dotnet test` once the native library is built; the test host finds it automatically in `Source/Native/build`, or point `ENET_NATIVE_LIB_DIR` (directory) or `ENET_NATIVE_LIB_PATH` (exact file) at it.
+
+Installing from GitHub Packages
 --------
-You can grab compiled libraries from the [release](https://github.com/nxrighthere/ENet-CSharp/releases) section or from [NuGet](https://www.nuget.org/packages/ENet-CSharp):
+This fork publishes the `ENet-CSharp` NuGet package to GitHub Packages (not nuget.org). The package contains the managed assembly plus native libraries for Windows (x64), Linux (x64), and macOS (universal arm64 + x86_64).
 
-`ENet-CSharp` contains compiled assembly with native libraries for the .NET environment (.NET Standard 2.1).
+Add the feed to a `nuget.config` next to your solution. GitHub requires authentication to read packages, so use a personal access token with the `read:packages` scope:
 
-`ENet-Unity` contains script with native libraries for the Unity.
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="ahmed310" value="https://nuget.pkg.github.com/Ahmed310/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <ahmed310>
+      <add key="Username" value="Ahmed310" />
+      <add key="ClearTextPassword" value="%GH_PACKAGES_PAT%" />
+    </ahmed310>
+  </packageSourceCredentials>
+  <packageSourceMapping>
+    <!-- Guarantees ENet-CSharp always resolves from this feed, never nuget.org -->
+    <packageSource key="ahmed310">
+      <package pattern="ENet-CSharp" />
+    </packageSource>
+    <packageSource key="nuget.org">
+      <package pattern="*" />
+    </packageSource>
+  </packageSourceMapping>
+</configuration>
+```
 
-It's highly recommended to delete a folder with binaries instead of replacing it to upgrade.
+Then install:
 
-These packages are provided only for traditional platforms: Windows, Linux, and macOS (x64).
+```
+dotnet add package ENet-CSharp --version 2.6.0
+```
+
+Android, iOS, and visionOS native libraries are built by CI and published as workflow artifacts (`enet-all-platforms`) for manual placement in Unity projects.
 
 Supported OS versions:
 - Windows 7 or higher
 - Linux 4.4 or higher
 - macOS 10.12 or higher
+
+Buffer pool
+--------
+The native library maintains a fixed-size pool of packet buffers to avoid per-packet heap allocation on the hot path:
+
+- Block size is 1024 bytes, holding the packet header plus up to 984 bytes of payload. Packets with larger payloads transparently fall back to the general allocator (including fragmented transfers of any size).
+- The pool retains at most 576 released blocks (~590 KB ceiling); there is no warm-up phase, blocks enter the pool as packets are destroyed.
+- Both the send path (`Packet.Create`) and the receive path draw from the same pool.
+- `ENet.Library.GetPoolStatistics()` exposes hits/misses/oversized/returned/retained counters, and `ENet.Library.DrainPool()` releases retained blocks.
+- Building the native library with `-DENET_NO_POOL` (compile definition `ENET_NO_POOL`) disables pooling entirely.
+
+Like the rest of ENet, the pool is intentionally not thread-safe: the library is designed to run single-threaded. All calls — including `Packet.Create` and `Packet.Dispose` — must happen on the thread that services the host. Dispose received packets only after a properly synchronized handoff, and never dispose a packet you already handed to `Send`/`Broadcast` from another thread.
 
 Usage
 --------

@@ -2,10 +2,30 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>netstandard2.1;netcoreapp3.1;net8.0</TargetFrameworks>
+    <TargetFrameworks>netstandard2.1;net10.0</TargetFrameworks>
     <Platforms>x64</Platforms>
     <RootNamespace>ENet</RootNamespace>
-    <LangVersion>3</LangVersion>
+    <LangVersion>9</LangVersion>
+
+    <Version>2.6.0</Version>
+    <AssemblyVersion>2.6.0.0</AssemblyVersion>
+    <FileVersion>2.6.0.0</FileVersion>
+
+    <PackageId>ENet-CSharp</PackageId>
+    <Authors>Stanislav Denisov</Authors>
+    <Description>Reliable UDP networking library for the .NET environment (fork with fixed-size native packet-buffer pooling)</Description>
+    <PackageTags>networking udp protocol ipv4 ipv6 gamedev</PackageTags>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/Ahmed310/ENet-CSharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Ahmed310/ENet-CSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <DebugType>embedded</DebugType>
+    <IncludeSymbols>false</IncludeSymbols>
+
+    <!-- Native binaries staged here (by CI or by hand) get packed into runtimes/ -->
+    <NativeRuntimesDir Condition="'$(NativeRuntimesDir)' == ''">$(MSBuildThisFileDirectory)runtimes</NativeRuntimesDir>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -17,5 +37,18 @@
     <Optimize>true</Optimize>
     <CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="" />
+    <None Include="$(NativeRuntimesDir)\**" Pack="true" PackagePath="runtimes\" />
+  </ItemGroup>
+
+  <!-- A pack without the desktop natives would produce a package that cannot load at runtime -->
+  <Target Name="EnsureNativePayload" BeforeTargets="GenerateNuspec" Condition="'$(NoNativeCheck)' != 'true'">
+    <Error Condition="!Exists('$(NativeRuntimesDir)\win-x64\native\enet.dll')" Text="Missing win-x64 native library for pack: $(NativeRuntimesDir)\win-x64\native\enet.dll" />
+    <Error Condition="!Exists('$(NativeRuntimesDir)\linux-x64\native\libenet.so')" Text="Missing linux-x64 native library for pack: $(NativeRuntimesDir)\linux-x64\native\libenet.so" />
+    <Error Condition="!Exists('$(NativeRuntimesDir)\osx\native\libenet.dylib')" Text="Missing osx universal native library for pack: $(NativeRuntimesDir)\osx\native\libenet.dylib" />
+  </Target>
 
 </Project>

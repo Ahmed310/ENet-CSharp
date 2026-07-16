@@ -3,6 +3,7 @@ name: Build ENet-CSharp
 on:
   push:
     branches: [ master, main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master, main ]
   workflow_dispatch:
@@ -84,34 +85,37 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Native - macOS
+    name: Native - macOS (universal)
     runs-on: macos-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CMake
-        run: brew install cmake
-
       - name: Configure and build
         run: |
           cmake -S Source/Native -B build-macos \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DENET_SHARED=true
           cmake --build build-macos --config Release
 
-      - name: Verify output
+      - name: Verify universal binary
         run: |
           echo "=== macOS outputs ==="
           find build-macos -type f | sort
-          test -n "$(find build-macos -name "*.dylib" -print -quit)"
+          DYLIB=$(find build-macos -name "*.dylib" -print -quit)
+          test -n "$DYLIB"
+          ARCHS=$(lipo -archs "$DYLIB")
+          echo "Architectures: $ARCHS"
+          case "$ARCHS" in
+            *x86_64*arm64*|*arm64*x86_64*) echo "Universal binary confirmed" ;;
+            *) echo "Dylib is not universal (need arm64 + x86_64)"; exit 1 ;;
+          esac
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: enet-macos-x64
+          name: enet-macos-universal
           path: build-macos/*.dylib
           if-no-files-found: error
 
@@ -130,17 +134,6 @@ jobs:
           sdkmanager "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
-      - name: Show Android build files
-        run: |
-          echo "=== Source/Native/jni ==="
-          ls -la Source/Native/jni
-          echo ""
-          echo "=== Application.mk ==="
-          cat Source/Native/jni/Application.mk
-          echo ""
-          echo "=== Android.mk ==="
-          cat Source/Native/jni/Android.mk
-
       - name: Build with ndk-build
         run: |
           "$ANDROID_NDK_HOME/ndk-build" \
@@ -153,18 +146,10 @@ jobs:
 
       - name: Collect unstripped .so files from obj/local
         run: |
-          echo "=== obj/local structure ==="
-          find Source/Native/obj/local -type f | sort
-          echo ""
-          echo "=== Copying unstripped libs ==="
-          mkdir -p android-out/arm64-v8a
-          mkdir -p android-out/armeabi-v7a
-          mkdir -p android-out/x86_64
-          cp Source/Native/obj/local/arm64-v8a/libenet.so   android-out/arm64-v8a/libenet.so || true
-          cp Source/Native/obj/local/armeabi-v7a/libenet.so android-out/armeabi-v7a/libenet.so || true
-          cp Source/Native/obj/local/x86_64/libenet.so      android-out/x86_64/libenet.so || true
-          echo ""
-          echo "=== Final sizes (should be ~200KB for arm64-v8a) ==="
+          mkdir -p android-out/arm64-v8a android-out/armeabi-v7a android-out/x86_64
+          cp Source/Native/obj/local/arm64-v8a/libenet.so   android-out/arm64-v8a/libenet.so
+          cp Source/Native/obj/local/armeabi-v7a/libenet.so android-out/armeabi-v7a/libenet.so
+          cp Source/Native/obj/local/x86_64/libenet.so      android-out/x86_64/libenet.so
           find android-out -name "*.so" | xargs ls -lh
 
       - name: Verify 16KB page alignment
@@ -199,14 +184,9 @@ jobs:
         run: |
           echo "=== All outputs from build-ios.sh ==="
           find Source/Native/build -type f | sort
-          echo ""
-          echo "=== Sizes ==="
-          find Source/Native/build -name "*.a" | xargs ls -lh
-          echo ""
-          echo "=== Checking all three targets exist ==="
-          test -f Source/Native/build/ios/libenet.a           && echo "✅ iOS device" || echo "❌ iOS device MISSING"
-          test -f Source/Native/build/visionos/libenet.a      && echo "✅ visionOS device" || echo "❌ visionOS device MISSING"
-          test -f Source/Native/build/visionos-sim/libenet.a  && echo "✅ visionOS Simulator" || echo "❌ visionOS Simulator MISSING"
+          test -f Source/Native/build/ios/libenet.a
+          test -f Source/Native/build/visionos/libenet.a
+          test -f Source/Native/build/visionos-sim/libenet.a
 
       - name: Upload iOS artifact
         uses: actions/upload-artifact@v4
@@ -239,7 +219,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Build C# project
         run: dotnet build Source/Managed/ENet-CSharp.csproj -c Release
@@ -248,7 +228,8 @@ jobs:
         run: |
           echo "=== Managed outputs ==="
           find Source/Managed/bin/Release -type f | sort
-          test -n "$(find Source/Managed/bin/Release -name "*.dll" -print -quit)"
+          test -f Source/Managed/bin/Release/netstandard2.1/ENet-CSharp.dll
+          test -f Source/Managed/bin/Release/net10.0/ENet-CSharp.dll
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -256,6 +237,163 @@ jobs:
           name: enet-csharp-assembly
           path: Source/Managed/bin/Release/**/*.dll
           if-no-files-found: error
+
+  test-linux:
+    name: Test - Linux
+    needs: build-linux
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download native library
+        uses: actions/download-artifact@v4
+        with:
+          name: enet-linux-x64
+          path: native-lib
+
+      - name: Run tests against the shipped binary
+        env:
+          ENET_NATIVE_LIB_DIR: ${{ github.workspace }}/native-lib
+        run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
+
+  test-windows:
+    name: Test - Windows
+    needs: build-windows
+    runs-on: windows-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download native library
+        uses: actions/download-artifact@v4
+        with:
+          name: enet-windows-x64
+          path: native-lib
+
+      - name: Run tests against the shipped binary
+        env:
+          ENET_NATIVE_LIB_DIR: ${{ github.workspace }}\native-lib
+        run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
+
+  test-macos:
+    name: Test - macOS
+    needs: build-macos
+    runs-on: macos-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download native library
+        uses: actions/download-artifact@v4
+        with:
+          name: enet-macos-universal
+          path: native-lib
+
+      - name: Run tests against the shipped binary
+        env:
+          ENET_NATIVE_LIB_DIR: ${{ github.workspace }}/native-lib
+        run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
+
+  pack:
+    name: Pack NuGet Package
+    needs:
+      - build-csharp
+      - test-linux
+      - test-windows
+      - test-macos
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Verify tag matches project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' Source/Managed/ENet-CSharp.csproj)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "csproj version: $VERSION, tag: $TAG"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "Tag v$TAG does not match <Version>$VERSION</Version> in the csproj"
+            exit 1
+          fi
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Stage native runtimes
+        run: |
+          mkdir -p Source/Managed/runtimes/win-x64/native
+          mkdir -p Source/Managed/runtimes/linux-x64/native
+          mkdir -p Source/Managed/runtimes/osx/native
+          cp artifacts/enet-windows-x64/enet.dll        Source/Managed/runtimes/win-x64/native/
+          cp artifacts/enet-linux-x64/libenet.so        Source/Managed/runtimes/linux-x64/native/
+          cp artifacts/enet-macos-universal/libenet.dylib Source/Managed/runtimes/osx/native/
+          find Source/Managed/runtimes -type f | xargs ls -lh
+
+      - name: Pack
+        run: dotnet pack Source/Managed/ENet-CSharp.csproj -c Release -o nupkg
+
+      - name: Inspect package
+        run: |
+          ls -lh nupkg/
+          unzip -l nupkg/*.nupkg
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: nupkg/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    name: Publish to GitHub Packages
+    needs: pack
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: nupkg
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push "nupkg/*.nupkg" \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
 
   package:
     name: Bundle All Artifacts
@@ -266,6 +404,9 @@ jobs:
       - build-android
       - build-ios
       - build-csharp
+      - test-linux
+      - test-windows
+      - test-macos
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
     steps:
