@@ -33,9 +33,9 @@ namespace ENet.Tests {
 
 		[Fact]
 		public void Version_IsLockstepped() {
-			// 2.6.0 on both sides; the fixture's successful Initialize() already proved the
+			// 2.6.1 on both sides; the fixture's successful Initialize() already proved the
 			// native library agrees (a mismatch throws "Incompatible version")
-			Assert.Equal((2u << 16) | (6u << 8) | 0u, Library.version);
+			Assert.Equal((2u << 16) | (6u << 8) | 1u, Library.version);
 		}
 
 		[Fact]

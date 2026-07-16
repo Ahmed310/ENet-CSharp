@@ -1,3 +1,10 @@
+ENet-CSharp-FigNet 2.6.1
+--------
+
+- Published to nuget.org as `ENet-CSharp-FigNet` (public, anonymous consumption; the `ENet-CSharp` id belongs to the original author). CI publishes via NuGet Trusted Publishing (OIDC) - no API key stored. The assembly name (`ENet-CSharp.dll`) and namespace (`ENet`) are unchanged, so it is a drop-in for the original `ENet-CSharp` package.
+- Removed the upstream "Supporters" section from the README; README now documents nuget.org installation.
+- Version bumped to 2.6.1 in lockstep (`ENET_VERSION`, managed `Library.version`); no wire-protocol change, interoperable with 2.6.0/2.5.3 peers.
+
 ENet-CSharp 2.6.0
 --------
 

@@ -36,73 +36,15 @@ The managed assembly builds with the .NET 10 SDK (`dotnet build Source/Managed/E
 
 Tests live in `Source/Managed.Tests` and run with `dotnet test` once the native library is built; the test host finds it automatically in `Source/Native/build`, or point `ENET_NATIVE_LIB_DIR` (directory) or `ENET_NATIVE_LIB_PATH` (exact file) at it.
 
-Installing from GitHub Packages
+Installing
 --------
-This fork publishes the `ENet-CSharp` NuGet package to GitHub Packages (not nuget.org). The package contains the managed assembly plus native libraries for Windows (x64), Linux (x64), and macOS (universal arm64 + x86_64).
-
-Add the feed to a `nuget.config` next to your solution. GitHub requires authentication to read packages, so use a personal access token with the `read:packages` scope:
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <packageSources>
-    <add key="ahmed310" value="https://nuget.pkg.github.com/Ahmed310/index.json" />
-  </packageSources>
-  <packageSourceCredentials>
-    <ahmed310>
-      <add key="Username" value="Ahmed310" />
-      <add key="ClearTextPassword" value="%GH_PACKAGES_PAT%" />
-    </ahmed310>
-  </packageSourceCredentials>
-  <packageSourceMapping>
-    <!-- Guarantees ENet-CSharp always resolves from this feed, never nuget.org -->
-    <packageSource key="ahmed310">
-      <package pattern="ENet-CSharp" />
-    </packageSource>
-    <packageSource key="nuget.org">
-      <package pattern="*" />
-    </packageSource>
-  </packageSourceMapping>
-</configuration>
-```
-
-Then install:
+This fork is published to nuget.org as [`ENet-CSharp-FigNet`](https://www.nuget.org/packages/ENet-CSharp-FigNet) (the `ENet-CSharp` id belongs to the original author). It is a public package, so no authentication or feed configuration is needed:
 
 ```
-dotnet add package ENet-CSharp --version 2.6.0
+dotnet add package ENet-CSharp-FigNet
 ```
 
-### Consuming in CI (GitHub Actions)
-
-GitHub Packages requires authentication even for public repositories, so a CI job must add the feed with a token before restoring. If the consuming repository lives under the **same** owner (`Ahmed310`), the built-in `GITHUB_TOKEN` works once the job requests `packages: read`; from a different owner, use a classic PAT (with `read:packages`) stored as a secret:
-
-```yaml
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read          # only needed for the same-owner GITHUB_TOKEN case
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-
-      - name: Add ENet-CSharp GitHub Packages source
-        run: >
-          dotnet nuget add source "https://nuget.pkg.github.com/Ahmed310/index.json"
-          --name ahmed310
-          --username Ahmed310
-          --password "${{ secrets.GITHUB_TOKEN }}"
-          --store-password-in-clear-text
-        # cross-owner: replace secrets.GITHUB_TOKEN with a PAT secret, e.g. secrets.GH_PACKAGES_PAT
-
-      - run: dotnet restore
-      - run: dotnet build -c Release --no-restore
-```
-
-`--store-password-in-clear-text` is required on Linux/macOS runners because the encrypted credential store is unavailable there. A checked-in `nuget.config` with `packageSourceMapping` (as above) still applies, so `ENet-CSharp` resolves from this feed and everything else from nuget.org.
+The package contains the managed assembly plus native libraries for Windows (x64), Linux (x64), and macOS (universal arm64 + x86_64). The assembly is still `ENet-CSharp.dll` and the namespace is still `ENet`, so switching from the original `ENet-CSharp` package needs no code changes - only the `PackageReference` id.
 
 Android, iOS, and visionOS native libraries are built by CI and published as workflow artifacts (`enet-all-platforms`) for manual placement in Unity projects.
 
