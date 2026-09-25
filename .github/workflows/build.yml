@@ -257,6 +257,7 @@ jobs:
       - name: Run tests against the shipped binary
         env:
           ENET_NATIVE_LIB_DIR: ${{ github.workspace }}/native-lib
+          ENET_EXPECT_POOL: '1'
         run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
 
   test-windows:
@@ -281,6 +282,7 @@ jobs:
       - name: Run tests against the shipped binary
         env:
           ENET_NATIVE_LIB_DIR: ${{ github.workspace }}\native-lib
+          ENET_EXPECT_POOL: '1'
         run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
 
   test-macos:
@@ -305,7 +307,56 @@ jobs:
       - name: Run tests against the shipped binary
         env:
           ENET_NATIVE_LIB_DIR: ${{ github.workspace }}/native-lib
+          ENET_EXPECT_POOL: '1'
         run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
+
+  test-linux-nopool:
+    name: Test - Linux (ENET_NO_POOL)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build the no-pool native library
+        run: |
+          cmake -S Source/Native -B build-nopool -DCMAKE_BUILD_TYPE=Release -DENET_SHARED=true -DENET_NO_POOL=true
+          cmake --build build-nopool --config Release
+
+      - name: Run tests against the no-pool build
+        env:
+          ENET_NATIVE_LIB_PATH: ${{ github.workspace }}/build-nopool/libenet.so
+          ENET_EXPECT_POOL: '0'
+        run: dotnet test Source/Managed.Tests/ENet-CSharp.Tests.csproj -c Release --logger "console;verbosity=normal"
+
+  sanitize-linux:
+    name: Sanitizers - Linux (TSan, ASan)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ThreadSanitizer cannot map its shadow memory with the default ASLR entropy on recent kernels
+      - name: Lower mmap randomization for ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: ThreadSanitizer stress (pool, 4 phases)
+        run: |
+          gcc -O1 -g -fsanitize=thread -fPIC -shared -o libenet_tsan.so Source/Native/enet.c -lpthread
+          gcc -O1 -g -fsanitize=thread -o pool_stress_tsan Source/Native/bench/pool_stress.c -ldl -lpthread
+          TSAN_OPTIONS="halt_on_error=1" ./pool_stress_tsan ./libenet_tsan.so 5
+
+      - name: AddressSanitizer + LeakSanitizer stress (pool and ENET_NO_POOL)
+        run: |
+          gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer -o pool_stress_asan Source/Native/bench/pool_stress.c -ldl -lpthread
+          gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer -fPIC -shared -o libenet_asan.so Source/Native/enet.c -lpthread
+          gcc -O1 -g -DENET_NO_POOL -fsanitize=address -fno-omit-frame-pointer -fPIC -shared -o libenet_asan_nopool.so Source/Native/enet.c -lpthread
+          ASAN_OPTIONS="detect_leaks=1" ./pool_stress_asan ./libenet_asan.so 5
+          ASAN_OPTIONS="detect_leaks=1" ./pool_stress_asan ./libenet_asan_nopool.so 5
 
   pack:
     name: Pack NuGet Package
@@ -314,6 +365,8 @@ jobs:
       - test-linux
       - test-windows
       - test-macos
+      - test-linux-nopool
+      - sanitize-linux
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
     steps:
@@ -410,6 +463,8 @@ jobs:
       - test-linux
       - test-windows
       - test-macos
+      - test-linux-nopool
+      - sanitize-linux
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
     steps:
