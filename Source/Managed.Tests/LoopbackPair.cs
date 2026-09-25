@@ -1,11 +1,12 @@
 using System;
 using System.Diagnostics;
+using System.Threading;
 
 namespace ENet.Tests {
 	/// <summary>
 	/// A connected server/client host pair on 127.0.0.1. Everything runs on the calling thread,
-	/// honoring ENet's single-thread contract. Received packets are handed to the event handler,
-	/// which owns disposing them.
+	/// honoring ENet's one-thread-per-host contract; several pairs may run on several threads.
+	/// Received packets are handed to the event handler, which owns disposing them.
 	/// </summary>
 	internal sealed class LoopbackPair : IDisposable {
 		private static int nextPort = 27100;
@@ -16,7 +17,7 @@ namespace ENet.Tests {
 		public Peer ServerToClient;
 
 		public LoopbackPair(int channelLimit = 2) {
-			ushort port = (ushort)nextPort++;
+			ushort port = (ushort)Interlocked.Increment(ref nextPort);
 
 			Address listenAddress = new Address { Port = port };
 
