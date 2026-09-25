@@ -3,20 +3,68 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Xunit;
+using Xunit.Sdk;
 
 namespace ENet.Tests {
 	/// <summary>
-	/// Initializes the ENet library once for the whole run. The library (and the native buffer
-	/// pool) is single-threaded and process-global, so all test classes share this collection
-	/// and parallelization is disabled in xunit.runner.json.
+	/// Initializes the ENet library once for the whole run. Library initialization and the pool's
+	/// process-wide counters are shared by every test, and several tests assert counter deltas or
+	/// spin up their own threads, so all test classes share this collection and parallelization is
+	/// disabled in xunit.runner.json. Each host must still be serviced by one thread at a time.
 	/// </summary>
 	[CollectionDefinition("ENet", DisableParallelization = true)]
 	public class ENetCollection : ICollectionFixture<ENetFixture> {
 	}
 
+	/// <summary>
+	/// Publishes the executing thread's pending pool counts before and after every test. Threads
+	/// publish in batches, so without this an idle test thread that exits later (the thread pool
+	/// retires idle threads) would add its leftover counts in the middle of another test's deltas.
+	/// </summary>
+	public sealed class FlushPoolCountersAttribute : BeforeAfterTestAttribute {
+		public override void Before(MethodInfo methodUnderTest) {
+			Flush();
+		}
+
+		public override void After(MethodInfo methodUnderTest) {
+			Flush();
+		}
+
+		private static void Flush() {
+			try {
+				Library.GetPoolStatistics();
+			} catch (Exception) {
+				// The test itself reports a native library that failed to load
+			}
+		}
+	}
+
+	/// <summary>
+	/// A fact that asserts buffer-pool counters: skipped when the native library under test was
+	/// built with ENET_NO_POOL (every counter stays zero there).
+	/// </summary>
+	public sealed class PoolFactAttribute : FactAttribute {
+		public PoolFactAttribute() {
+			if (!ENetFixture.PoolCompiledIn)
+				Skip = "Native library was built with ENET_NO_POOL";
+		}
+	}
+
 	public class ENetFixture : IDisposable {
 		static ENetFixture() {
 			NativeLibrary.SetDllImportResolver(typeof(Library).Assembly, ResolveNativeLibrary);
+		}
+
+		/// <summary>Whether the native library under test pools packet blocks (no initialization needed).</summary>
+		public static bool PoolCompiledIn {
+			get {
+				try {
+					return Library.PoolBlockSize > 0;
+				} catch (Exception) {
+					// Let the test itself surface the load failure
+					return true;
+				}
+			}
 		}
 
 		public ENetFixture() {

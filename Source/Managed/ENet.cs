@@ -80,6 +80,20 @@ namespace ENet {
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
+	internal struct ENetPoolStatistics {
+		public ulong hits;
+		public ulong misses;
+		public ulong oversized;
+		public ulong returned;
+		public ulong freed;
+		public ulong drained;
+		public ulong retained;
+		public ulong threadRetained;
+		public ulong orphaned;
+		public ulong caches;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
 	internal struct ENetCallbacks {
 		public AllocCallback malloc;
 		public FreeCallback free;
@@ -1065,27 +1079,72 @@ namespace ENet {
 			return Native.enet_crc64(buffers, bufferCount);
 		}
 
+		/// <summary>
+		/// Process-wide pool counters, safe to call from any thread. Each thread publishes its counts in
+		/// small batches, so another thread's latest operations can show up with a short delay; the
+		/// calling thread's own counts are always current.
+		/// </summary>
 		public static PoolStatistics GetPoolStatistics() {
+			ENetPoolStatistics native;
+
+			Native.enet_pool_get_statistics_ex(out native);
+
 			PoolStatistics statistics = default(PoolStatistics);
 
-			Native.enet_pool_get_statistics(out statistics.Hits, out statistics.Misses, out statistics.Oversized, out statistics.Returned, out statistics.Retained);
+			statistics.Hits = native.hits;
+			statistics.Misses = native.misses;
+			statistics.Oversized = native.oversized;
+			statistics.Returned = native.returned;
+			statistics.Freed = native.freed;
+			statistics.Drained = native.drained;
+			statistics.Retained = (uint)native.retained;
+			statistics.ThreadRetained = (uint)native.threadRetained;
+			statistics.Orphaned = (uint)native.orphaned;
+			statistics.Caches = (uint)native.caches;
 
 			return statistics;
 		}
 
+		/// <summary>
+		/// Frees the calling thread's cached blocks and the blocks parked by exited threads. Other live
+		/// threads keep their caches; call it on a network thread before the thread exits to release
+		/// that thread's blocks immediately (otherwise the thread-exit hook parks them for reuse).
+		/// </summary>
 		public static void DrainPool() {
 			Native.enet_pool_drain();
+		}
+
+		/// <summary>Pool block size in bytes (header included), or 0 when the native library was built with ENET_NO_POOL.</summary>
+		public static int PoolBlockSize {
+			get {
+				return (int)Native.enet_pool_get_block_size();
+			}
 		}
 
 		private static Callbacks rootedCallbacks;
 	}
 
 	public struct PoolStatistics {
+		/// <summary>Pooled acquisitions served from a thread cache.</summary>
 		public ulong Hits;
+		/// <summary>Pooled acquisitions that allocated a fresh block.</summary>
 		public ulong Misses;
+		/// <summary>Acquisitions larger than a block, allocated directly and never pooled.</summary>
 		public ulong Oversized;
+		/// <summary>Pooled blocks released into a thread cache.</summary>
 		public ulong Returned;
+		/// <summary>Pooled blocks released to the allocator (cache full, or pool disabled after Deinitialize).</summary>
+		public ulong Freed;
+		/// <summary>Cached blocks released to the allocator (DrainPool, Deinitialize, orphan trimming).</summary>
+		public ulong Drained;
+		/// <summary>Blocks cached process-wide: every thread cache plus the orphans.</summary>
 		public uint Retained;
+		/// <summary>Blocks cached by the calling thread (at most 128).</summary>
+		public uint ThreadRetained;
+		/// <summary>Blocks parked by exited threads, waiting to be adopted by a thread whose cache runs dry.</summary>
+		public uint Orphaned;
+		/// <summary>Live per-thread caches.</summary>
+		public uint Caches;
 	}
 
 	[SuppressUnmanagedCodeSecurity]
@@ -1160,7 +1219,10 @@ namespace ENet {
 		internal static extern void enet_packet_dispose(IntPtr packet);
 
 		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
-		internal static extern void enet_pool_get_statistics(out ulong hits, out ulong misses, out ulong oversized, out ulong returned, out uint retained);
+		internal static extern void enet_pool_get_statistics_ex(out ENetPoolStatistics statistics);
+
+		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
+		internal static extern uint enet_pool_get_block_size();
 
 		[DllImport(nativeLibrary, CallingConvention = CallingConvention.Cdecl)]
 		internal static extern void enet_pool_drain();

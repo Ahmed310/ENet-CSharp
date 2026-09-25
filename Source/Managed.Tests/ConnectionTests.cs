@@ -2,6 +2,7 @@ using Xunit;
 
 namespace ENet.Tests {
 	[Collection("ENet")]
+	[FlushPoolCounters]
 	public class ConnectionTests {
 		[Fact]
 		public void Connect_Then_Disconnect_RaisesEvents() {

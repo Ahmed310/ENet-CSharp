@@ -4,8 +4,9 @@ using Xunit;
 
 namespace ENet.Tests {
 	[Collection("ENet")]
+	[FlushPoolCounters]
 	public class PoolTests {
-		[Fact]
+		[PoolFact]
 		public void PoolExhaustion_Hold700Undisposed_ThenDisposeAll() {
 			using LoopbackPair pair = new LoopbackPair();
 
@@ -60,11 +61,11 @@ namespace ENet.Tests {
 				Assert.Equal(payload, buffer);
 			}
 
-			// Empty the pool so the release accounting below is deterministic: disposing 700
-			// pooled blocks into an empty pool must retain exactly the 576-block cap
+			// Empty this thread's cache so the release accounting below is deterministic: disposing
+			// 700 pooled blocks into an empty cache must retain exactly the 128-block per-thread cap
 			Library.DrainPool();
 
-			Assert.Equal(0u, Library.GetPoolStatistics().Retained);
+			Assert.Equal(0u, Library.GetPoolStatistics().ThreadRetained);
 
 			PoolStatistics beforeDispose = Library.GetPoolStatistics();
 
@@ -75,12 +76,13 @@ namespace ENet.Tests {
 
 			PoolStatistics afterDispose = Library.GetPoolStatistics();
 
-			Assert.Equal(576u, afterDispose.Returned - beforeDispose.Returned);
-			Assert.Equal(576u, afterDispose.Retained);
+			Assert.Equal(128ul, afterDispose.Returned - beforeDispose.Returned);
+			Assert.Equal(572ul, afterDispose.Freed - beforeDispose.Freed);
+			Assert.Equal(128u, afterDispose.ThreadRetained);
 
 			Library.DrainPool();
 
-			Assert.Equal(0u, Library.GetPoolStatistics().Retained);
+			Assert.Equal(0u, Library.GetPoolStatistics().ThreadRetained);
 
 			// Traffic still works after exhaustion, release, and drain
 			Packet final = new Packet();
