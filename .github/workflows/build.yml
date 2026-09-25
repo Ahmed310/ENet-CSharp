@@ -153,14 +153,32 @@ jobs:
           cp Source/Native/obj/local/x86_64/libenet.so      android-out/x86_64/libenet.so
           find android-out -name "*.so" | xargs ls -lh
 
+      # Fails the build if a 64-bit library would not load on a 16 KB-page device
       - name: Verify 16KB page alignment
         run: |
           LLVM_READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          find android-out -name "*.so" | while read -r f; do
+          status=0
+          for f in android-out/*/libenet.so; do
             echo ""
             echo "File: $f"
             "$LLVM_READELF" --program-headers "$f" | grep -E "LOAD|Align" || true
+            case "$f" in
+              */arm64-v8a/*|*/x86_64/*)
+                smallest=""
+                for align in $("$LLVM_READELF" --program-headers "$f" | awk '$1 == "LOAD" { print $NF }'); do
+                  value=$((align))
+                  if [ -z "$smallest" ] || [ "$value" -lt "$smallest" ]; then smallest=$value; fi
+                done
+                if [ -z "$smallest" ] || [ "$smallest" -lt 16384 ]; then
+                  echo "::error file=$f::LOAD segments are aligned to $smallest bytes; 16 KB-page devices need 16384"
+                  status=1
+                else
+                  echo "OK: every LOAD segment is aligned to at least 16 KB"
+                fi
+                ;;
+            esac
           done
+          exit $status
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
