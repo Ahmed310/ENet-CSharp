@@ -4,7 +4,7 @@
 
 [![GitHub release](https://img.shields.io/github/v/tag/Ahmed310/ENet-CSharp.svg?style=flat-square)](https://github.com/Ahmed310/ENet-CSharp/tags)
 
-This is an independent ENet implementation with a modified protocol for C, C++, C#, and other languages. This fork of [nxrighthere/ENet-CSharp](https://github.com/nxrighthere/ENet-CSharp) adds fixed-size native packet-buffer pooling, wrapper stability fixes, and distributes via GitHub Packages instead of nuget.org.
+This is an independent ENet implementation with a modified protocol for C, C++, C#, and other languages. This fork of [nxrighthere/ENet-CSharp](https://github.com/nxrighthere/ENet-CSharp) adds a lock-free, thread-safe native packet-buffer pool, wrapper stability fixes, and is published on nuget.org as `ENet-CSharp-FigNet`.
 
 Features:
 
@@ -34,7 +34,9 @@ To build the library for Nintendo Switch, follow [this](https://pastebin.com/raw
 
 The managed assembly builds with the .NET 10 SDK (`dotnet build Source/Managed/ENet-CSharp.csproj -c Release`) and targets `netstandard2.1` (Unity/Mono) and `net10.0`.
 
-Tests live in `Source/Managed.Tests` and run with `dotnet test` once the native library is built; the test host finds it automatically in `Source/Native/build`, or point `ENET_NATIVE_LIB_DIR` (directory) or `ENET_NATIVE_LIB_PATH` (exact file) at it.
+Tests live in `Source/Managed.Tests` and run with `dotnet test` once the native library is built; the test host finds it automatically in `Source/Native/build`, or point `ENET_NATIVE_LIB_DIR` (directory) or `ENET_NATIVE_LIB_PATH` (exact file) at it. Pool-counter tests skip themselves against an `ENET_NO_POOL` build; `ENET_SOAK_SECONDS` lengthens the multi-threaded soak tests.
+
+Benchmarks and the multi-process stress test live in `Source/Managed.Benchmarks` (`enet-bench`, with drivers and a report generator under `scripts/`); `Source/Native/bench` holds a native throughput benchmark and a sanitizer stress harness.
 
 Installing
 --------
@@ -57,13 +59,18 @@ Buffer pool
 --------
 The native library maintains a fixed-size pool of packet buffers to avoid per-packet heap allocation on the hot path:
 
-- Block size is 1280 bytes, holding the packet header plus roughly 1240 bytes of payload on 64-bit (the ceiling is the block size minus `sizeof(ENetPacket)`), which covers typical game/MTU-class packets. Packets with larger payloads transparently fall back to the general allocator (including fragmented transfers of any size). The block size is a single tunable constant (`ENET_POOL_BLOCK_SIZE`) if you need to cover the full MTU.
-- The pool retains at most 576 released blocks (~720 KB ceiling); there is no warm-up phase, blocks enter the pool as packets are destroyed.
-- Both the send path (`Packet.Create`) and the receive path draw from the same pool.
-- `ENet.Library.GetPoolStatistics()` exposes hits/misses/oversized/returned/retained counters, and `ENet.Library.DrainPool()` releases retained blocks.
-- Building the native library with `-DENET_NO_POOL` (compile definition `ENET_NO_POOL`) disables pooling entirely.
+- Block size is 1288 bytes, holding the packet header plus up to 1248 bytes of payload on 64-bit (the ceiling is the block size minus `sizeof(ENetPacket)`). At the default 1280-byte MTU ENet fragments payloads above 1244 bytes, so every unfragmented packet is pooled. Packets with larger payloads transparently fall back to the general allocator (including fragmented transfers of any size). The block size is a single tunable constant (`ENET_POOL_BLOCK_SIZE`); raise it together with a larger MTU.
+- Every thread keeps its own cache of released blocks, a fixed array of 128 block pointers used as a stack (~160 KB of blocks per thread at most, `ENET_POOL_MAX_RETAINED`); there is no warm-up phase, blocks enter a cache as packets are destroyed, and releases beyond the cap go back to the allocator. Both the send path (`Packet.Create`) and the receive path draw from the calling thread's cache.
+- The pool is thread-safe and lock-free: acquiring and releasing a block touches only the calling thread's cache, with no lock and no atomic read-modify-write per packet (each thread publishes its counts with a few atomic adds every 64 operations). Hosts can be serviced on different threads (for example one network thread per socket), and a packet may be created on one thread and destroyed on another: its block joins the destroying thread's cache.
+- Reuse happens per thread. When packets are created on one thread and always destroyed on another, the creating thread's cache stays empty and every create allocates, while the destroying thread's cache fills to its cap. Any thread that destroys packets can hold up to ~160 KB of cached blocks.
+- When a thread exits, its cached blocks are parked process-wide and reused by the next thread whose cache runs dry (a reconnect's new network thread, for instance) instead of leaking. The exit hook is automatic on POSIX and in the Windows DLL built with MSVC or clang-cl; with a static Windows build or a MinGW build, call `ENet.Library.DrainPool()` on a thread before it exits.
+- `ENet.Library.GetPoolStatistics()` is safe from any thread and returns process-wide counters (hits, misses, oversized, returned, freed, drained) and levels (retained, the calling thread's `ThreadRetained`, orphaned, live caches). Threads publish their counts in small batches (whenever they read statistics, drain or exit, and every 64 operations), so another thread's latest operations can appear with a short delay. Once every thread has published and no packet is alive, `Hits + Misses == Returned + Freed`.
+- `ENet.Library.DrainPool()` frees the calling thread's cache and every parked block; `Library.Deinitialize()` does the same and disables pooling.
+- With custom allocator callbacks (`Library.Initialize(Callbacks)`), keep the same callbacks for the life of the process: blocks cached by other threads survive `Deinitialize` and are freed later with whichever callbacks are current.
+- Building the native library with `-DENET_NO_POOL` (CMake option `ENET_NO_POOL`) compiles the pool out: every packet uses the allocator exactly as before the pool existed, and `Library.PoolBlockSize` reports 0.
+- Compile-time tunables: `ENET_POOL_BLOCK_SIZE` (1288), `ENET_POOL_MAX_RETAINED` (128 blocks per thread), `ENET_POOL_STATS_BATCH` (64 operations between publishes), and `ENET_NO_DLLMAIN` to leave the pool's `DllMain` out of a DLL that defines its own.
 
-Like the rest of ENet, the pool is intentionally not thread-safe: the library is designed to run single-threaded. All calls — including `Packet.Create` and `Packet.Dispose` — must happen on the thread that services the host. Dispose received packets only after a properly synchronized handoff, and never dispose a packet you already handed to `Send`/`Broadcast` from another thread.
+The pool changes nothing about ENet's host rule: each `Host`, and its peers, must be serviced and used by one thread at a time.
 
 Usage
 --------
@@ -220,7 +227,7 @@ The best-known strategy is to use ENet in an independent I/O thread and utilize 
 ### Functionality
 In general, ENet is not thread-safe, but some of its functions can be used safely if the user is careful enough:
 
-`Packet` structure and its functions are safe until a packet is only moving across threads by value and a custom memory allocator is not used.
+`Packet` structure and its functions are safe until a packet is only moving across threads by value and a custom memory allocator is not used. Creating and destroying packets on several threads at once is safe, including with the buffer pool (2.7.0 and later; the 2.6.x pool was not thread-safe).
 
 `Peer.ID` as soon as a pointer to a peer was obtained from the native side, the ID will be cached in `Peer` structure for further actions with objects that assigned to that ID. `Peer` structure can be moved across threads by value, but its functions  are not thread-safe because data in memory may change by the service in another thread.
 
