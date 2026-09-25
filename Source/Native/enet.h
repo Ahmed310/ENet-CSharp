@@ -1675,67 +1675,20 @@ extern "C" {
 */
 
 	#ifdef _WIN32
-		static LARGE_INTEGER gettime_offset(void) {
-			SYSTEMTIME s;
-			FILETIME f;
-			LARGE_INTEGER t;
-			s.wYear = 1970;
-			s.wMonth = 1;
-			s.wDay = 1;
-			s.wHour = 0;
-			s.wMinute = 0;
-			s.wSecond = 0;
-			s.wMilliseconds = 0;
-
-			SystemTimeToFileTime(&s, &f);
-
-			t.QuadPart = f.dwHighDateTime;
-			t.QuadPart <<= 32;
-			t.QuadPart |= f.dwLowDateTime;
-
-			return t;
-		}
-
+		/* Stateless on purpose: hosts may be serviced on several threads, and the lazily initialized statics
+		   this used to keep raced (a thread could see "initialized" before the frequency was stored and divide
+		   by zero). QueryPerformanceFrequency cannot fail on Windows XP or later, and enet_time_get applies
+		   its own start offset. */
 		int clock_gettime(int X, struct timespec* tv) {
-			LARGE_INTEGER t;
-			FILETIME f;
-			double microseconds;
+			LARGE_INTEGER frequency, counter;
 
-			static LARGE_INTEGER offset;
-			static double frequencyToMicroseconds;
-			static int initialized = 0;
-			static BOOL usePerformanceCounter = 0;
+			(void)X;
 
-			if (!initialized) {
-				LARGE_INTEGER performanceFrequency;
-				initialized = 1;
-				usePerformanceCounter = QueryPerformanceFrequency(&performanceFrequency);
+			QueryPerformanceFrequency(&frequency);
+			QueryPerformanceCounter(&counter);
 
-				if (usePerformanceCounter) {
-					QueryPerformanceCounter(&offset);
-
-					frequencyToMicroseconds = (double)performanceFrequency.QuadPart / 1000000.;
-				} else {
-					offset = gettime_offset();
-					frequencyToMicroseconds = 10.;
-				}
-			}
-
-			if (usePerformanceCounter) {
-				QueryPerformanceCounter(&t);
-			} else {
-				GetSystemTimeAsFileTime(&f);
-
-				t.QuadPart = f.dwHighDateTime;
-				t.QuadPart <<= 32;
-				t.QuadPart |= f.dwLowDateTime;
-			}
-
-			t.QuadPart -= offset.QuadPart;
-			microseconds = (double)t.QuadPart / frequencyToMicroseconds;
-			t.QuadPart = (LONGLONG)microseconds;
-			tv->tv_sec = (long)(t.QuadPart / 1000000);
-			tv->tv_nsec = t.QuadPart % 1000000 * 1000;
+			tv->tv_sec = (long)(counter.QuadPart / frequency.QuadPart);
+			tv->tv_nsec = (long)((counter.QuadPart % frequency.QuadPart) * 1000000000 / frequency.QuadPart);
 
 			return 0;
 		}
