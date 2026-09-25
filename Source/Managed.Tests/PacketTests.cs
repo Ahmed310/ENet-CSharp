@@ -4,6 +4,7 @@ using Xunit;
 
 namespace ENet.Tests {
 	[Collection("ENet")]
+	[FlushPoolCounters]
 	public class PacketTests {
 		internal static byte[] MakePayload(int size, int seed) {
 			byte[] payload = new byte[size];
@@ -49,9 +50,9 @@ namespace ENet.Tests {
 			Assert.Equal(payload, RoundTrip(payload));
 		}
 
-		[Fact]
+		[PoolFact]
 		public void Send_1024Bytes_UsesPool() {
-			// 1024 + 40-byte header = 1064, within the 1280-byte pool block
+			// 1024 + 40-byte header = 1064, within the 1288-byte pool block
 			PoolStatistics before = Library.GetPoolStatistics();
 			byte[] payload = MakePayload(1024, 2);
 
@@ -62,12 +63,12 @@ namespace ENet.Tests {
 			// Send-side create + receive-side create both fit the pool
 			Assert.True(after.Hits + after.Misses - before.Hits - before.Misses >= 2, "Expected at least two pool acquisitions");
 			Assert.True(after.Returned > before.Returned, "Expected at least one block returned to the pool");
-			Assert.True(after.Retained <= 576);
+			Assert.True(after.ThreadRetained <= 128);
 		}
 
-		[Fact]
+		[PoolFact]
 		public void Send_1200Bytes_UsesPool() {
-			// 1200-byte game/MTU-class payload: 1200 + 40 = 1240, still within the 1280 block
+			// 1200-byte game/MTU-class payload: 1200 + 40 = 1240, still within the 1288 block
 			PoolStatistics before = Library.GetPoolStatistics();
 			byte[] payload = MakePayload(1200, 3);
 
@@ -76,13 +77,14 @@ namespace ENet.Tests {
 			PoolStatistics after = Library.GetPoolStatistics();
 
 			Assert.True(after.Hits + after.Misses - before.Hits - before.Misses >= 2, "Expected the 1200-byte payload to be pooled");
-			Assert.True(after.Retained <= 576);
+			Assert.True(after.ThreadRetained <= 128);
 		}
 
-		[Fact]
+		[PoolFact]
 		public void Send_OversizedPayload_FallsBack() {
-			// 1300 bytes exceeds the 1280-byte block on its own (header included), so it can never be
-			// pooled; still under the default MTU, so it stays a single unfragmented packet each side
+			// 1300 bytes exceeds the 1288-byte block on its own (header included), so it can never be
+			// pooled. At the default 1280 MTU it is also fragmented: the sent packet and the reassembled
+			// one on the receiving side are both allocated directly
 			PoolStatistics before = Library.GetPoolStatistics();
 			byte[] payload = MakePayload(1300, 4);
 

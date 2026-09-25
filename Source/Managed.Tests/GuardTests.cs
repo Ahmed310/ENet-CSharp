@@ -3,6 +3,7 @@ using Xunit;
 
 namespace ENet.Tests {
 	[Collection("ENet")]
+	[FlushPoolCounters]
 	public class GuardTests {
 		[Fact]
 		public void Create_OffsetGreaterThanLength_Throws() {
@@ -33,12 +34,32 @@ namespace ENet.Tests {
 
 		[Fact]
 		public void Version_IsLockstepped() {
-			// 2.6.1 on both sides; the fixture's successful Initialize() already proved the
+			// 2.7.0 on both sides; the fixture's successful Initialize() already proved the
 			// native library agrees (a mismatch throws "Incompatible version")
-			Assert.Equal((2u << 16) | (6u << 8) | 1u, Library.version);
+			Assert.Equal((2u << 16) | (7u << 8) | 0u, Library.version);
 		}
 
 		[Fact]
+		public void BuildFlavor_MatchesExpectation() {
+			// CI sets ENET_EXPECT_POOL so a job cannot silently test the wrong native build
+			string expected = Environment.GetEnvironmentVariable("ENET_EXPECT_POOL");
+
+			if (expected == "0") {
+				Assert.Equal(0, Library.PoolBlockSize);
+
+				Packet packet = new Packet();
+				packet.Create(PacketTests.MakePayload(64, 10));
+				packet.Dispose();
+
+				PoolStatistics statistics = Library.GetPoolStatistics();
+
+				Assert.Equal(0ul, statistics.Hits + statistics.Misses + statistics.Returned + statistics.Freed);
+			} else if (expected == "1") {
+				Assert.Equal(1288, Library.PoolBlockSize);
+			}
+		}
+
+		[PoolFact]
 		public void PoolStatistics_And_Drain_BehaveSanely() {
 			Packet packet = new Packet();
 			packet.Create(PacketTests.MakePayload(64, 9));
@@ -47,11 +68,15 @@ namespace ENet.Tests {
 			PoolStatistics statistics = Library.GetPoolStatistics();
 
 			Assert.True(statistics.Hits + statistics.Misses > 0, "Expected at least one pool acquisition by this point in the run");
-			Assert.True(statistics.Retained <= 576);
+			Assert.True(statistics.ThreadRetained >= 1 && statistics.ThreadRetained <= 128);
+			Assert.True(statistics.Caches >= 1, "The calling thread must own a cache after using the pool");
 
 			Library.DrainPool();
 
-			Assert.Equal(0u, Library.GetPoolStatistics().Retained);
+			statistics = Library.GetPoolStatistics();
+
+			Assert.Equal(0u, statistics.ThreadRetained);
+			Assert.Equal(0u, statistics.Orphaned);
 		}
 	}
 }

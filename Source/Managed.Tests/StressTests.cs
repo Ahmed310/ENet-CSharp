@@ -4,6 +4,7 @@ using Xunit;
 
 namespace ENet.Tests {
 	[Collection("ENet")]
+	[FlushPoolCounters]
 	public class StressTests {
 		[Fact]
 		public void RapidLoop_10000Packets_AllReceivedInOrder() {
@@ -76,10 +77,12 @@ namespace ENet.Tests {
 			Assert.Equal(total, received);
 			Assert.True(intact, "At least one packet arrived corrupted or out of order");
 
-			PoolStatistics after = Library.GetPoolStatistics();
+			if (Library.PoolBlockSize > 0) {
+				PoolStatistics after = Library.GetPoolStatistics();
 
-			Assert.True(after.Hits > before.Hits, "Expected the pool to recycle blocks during the rapid loop");
-			Assert.True(after.Retained <= 576);
+				Assert.True(after.Hits > before.Hits, "Expected the pool to recycle blocks during the rapid loop");
+				Assert.True(after.ThreadRetained <= 128);
+			}
 		}
 
 		[Fact]

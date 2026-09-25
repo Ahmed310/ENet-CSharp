@@ -9,6 +9,6 @@ APP_SHORT_COMMANDS := true
 APP_CPPFLAGS += -fPIC
 APP_CFLAGS += -fPIC
 
-ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
-  APP_LDFLAGS += -Wl,-z,max-page-size=16384
-endif
+# 16 KB page support (Android 15+ devices, Google Play): align 64-bit libraries to 16 KB. NDK r27 reads
+# this switch; r28 and later align by default. Android.mk also passes the linker flag, for any NDK.
+APP_SUPPORT_FLEXIBLE_PAGE_SIZES := true

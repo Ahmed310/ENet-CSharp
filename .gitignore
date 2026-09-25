@@ -6,3 +6,7 @@ Source/Managed/runtimes
 Source/Managed.Tests/bin
 Source/Managed.Tests/obj
 nupkg
+Source/Managed.Benchmarks/bin
+Source/Managed.Benchmarks/obj
+__pycache__
+Source/Managed.Benchmarks/results

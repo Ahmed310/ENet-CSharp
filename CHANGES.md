@@ -1,3 +1,19 @@
+ENet-CSharp-FigNet 2.7.0
+--------
+
+- **Fixed a native crash when hosts are serviced on more than one thread** (bragvr-gdd#351). The 2.6.x packet-buffer pool kept one process-wide free list with no synchronization, so two threads creating or destroying packets at once (for example FigNet's Entangle and FnVoice sockets, each on its own network thread) could hand the same block to two packets: heap corruption, or an access violation in `enet_packet_create`. The pool is now lock-free and thread-safe: every thread owns a cache, so the hot path takes no lock and performs no atomic read-modify-write (counts are published in batches). A packet may be destroyed on a different thread than the one that created it.
+- Each thread cache is a fixed array of 128 block pointers used as a stack (an index move per create and destroy). The array replaced a per-thread linked free list after both were benchmarked: they measured the same in every cell, and pre-allocated contiguous slabs were no faster and could not return memory.
+- Pool blocks are now 1288 bytes (payloads up to 1248 bytes on 64-bit), so every packet ENet sends unfragmented at the default 1280-byte MTU (payloads up to 1244 bytes) is pooled.
+- Threads that exit park their cached blocks process-wide, and the next thread whose cache runs dry adopts them (a reconnect's new network thread reuses its predecessor's blocks). The exit hook is a pthread key destructor on POSIX and `DLL_THREAD_DETACH` in the Windows DLL built with MSVC or clang-cl; static Windows and MinGW builds should call `DrainPool()` before a thread exits.
+- Pool semantics: the cap is 128 blocks per thread (2.6.x: 576 for the whole process); `DrainPool()` frees the calling thread's cache plus parked blocks; counters are process-lifetime totals and are no longer reset by `Initialize()`. Statistics are safe to read from any thread (threads publish in small batches).
+- New native exports (additive; existing ones unchanged): `enet_pool_get_statistics_ex` (adds `freed`, `drained`, `threadRetained`, `orphaned`, `caches`) and `enet_pool_get_block_size` (0 when built with `ENET_NO_POOL`). Managed: `PoolStatistics` gains `Freed`, `Drained`, `ThreadRetained`, `Orphaned` and `Caches`; new `Library.PoolBlockSize`.
+- Fixed a race in the managed wrapper: `Packet.SetFreeCallback`'s delegate registry was a plain `Dictionary` shared by all threads (and written from the thread that destroys the packet); it is now a `ConcurrentDictionary`.
+- The managed free-callback thunk carries a `MonoPInvokeCallback` attribute, which IL2CPP requires before it can hand the callback to native code (`Packet.SetFreeCallback(PacketFreeCallback)`).
+- Fixed a race in the Windows clock: `clock_gettime`'s lazily initialized statics could be read half-initialized by a second thread (divide by zero, garbage time). It is now stateless.
+- CMake: new `ENET_NO_POOL` option; Unix builds link pthreads; `ENET_DLL` is now defined for the shared library only, so a static library configured alongside it no longer exports symbols or carries the DLL's `DllMain`.
+- Tests: multi-threaded regression suite (the #351 repro, cross-thread create/destroy, two hosts serviced on two threads, thread exit and reconnect cycles, counter conservation, concurrent free callbacks); pool-counter tests skip against `ENET_NO_POOL` builds. New `Source/Managed.Benchmarks` (allocator benchmark, crash repro and multi-process stress test with telemetry) and `Source/Native/bench` (native benchmark and sanitizer stress harness).
+- Version bumped to 2.7.0 in lockstep (`ENET_VERSION`, managed `Library.version`); no wire-protocol change, interoperable with 2.6.x and 2.5.3 peers.
+
 ENet-CSharp-FigNet 2.6.1
 --------
 

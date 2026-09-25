@@ -30,8 +30,8 @@
 #include <time.h>
 
 #define ENET_VERSION_MAJOR 2
-#define ENET_VERSION_MINOR 6
-#define ENET_VERSION_PATCH 1
+#define ENET_VERSION_MINOR 7
+#define ENET_VERSION_PATCH 0
 #define ENET_VERSION_CREATE(major, minor, patch) (((major) << 16) | ((minor) << 8) | (patch))
 #define ENET_VERSION_GET_MAJOR(version) (((version) >> 16) & 0xFF)
 #define ENET_VERSION_GET_MINOR(version) (((version) >> 8) & 0xFF)
@@ -130,6 +130,7 @@
 	#include <string.h>
 	#include <errno.h>
 	#include <fcntl.h>
+	#include <pthread.h>
 
 	#ifdef __APPLE__
 		#include <mach/clock.h>
@@ -466,7 +467,7 @@ extern "C" {
 		ENET_PACKET_FLAG_INSTANT               = (1 << 4),
 		ENET_PACKET_FLAG_UNTHROTTLED           = (1 << 5),
 		ENET_PACKET_FLAG_SENT                  = (1 << 8),
-		ENET_PACKET_FLAG_POOLED                = (1 << 15) /* internal: block belongs to the shared buffer pool; stripped from caller-supplied flags */
+		ENET_PACKET_FLAG_POOLED                = (1 << 15) /* internal: block came from the buffer pool; stripped from caller-supplied flags */
 	} ENetPacketFlag;
 
 	typedef void (ENET_CALLBACK *ENetPacketFreeCallback)(void*);
@@ -758,7 +759,24 @@ extern "C" {
 	ENET_API int enet_packet_check_references(const ENetPacket*);
 	ENET_API void enet_packet_dispose(ENetPacket*);
 
+	/* Process-wide pool counters (monotonic for the process lifetime) and levels. With no packet alive,
+	   hits + misses == returned + freed, and retained == returned - hits - drained. */
+	typedef struct _ENetPoolStatistics {
+		uint64_t hits;           /* pooled acquisitions served from a thread cache */
+		uint64_t misses;         /* pooled acquisitions that allocated a fresh block */
+		uint64_t oversized;      /* acquisitions larger than a block, allocated directly and never pooled */
+		uint64_t returned;       /* pooled blocks released into a thread cache */
+		uint64_t freed;          /* pooled blocks released to the allocator (cache full or pool disabled) */
+		uint64_t drained;        /* cached blocks released to the allocator (drain, shutdown, orphan trim) */
+		uint64_t retained;       /* blocks cached process-wide: every thread cache plus the orphans */
+		uint64_t threadRetained; /* blocks cached by the calling thread */
+		uint64_t orphaned;       /* blocks parked by exited threads, waiting to be adopted */
+		uint64_t caches;         /* live per-thread caches */
+	} ENetPoolStatistics;
+
 	ENET_API void enet_pool_get_statistics(uint64_t* hits, uint64_t* misses, uint64_t* oversized, uint64_t* returned, uint32_t* retained);
+	ENET_API void enet_pool_get_statistics_ex(ENetPoolStatistics* statistics);
+	ENET_API uint32_t enet_pool_get_block_size(void);
 	ENET_API void enet_pool_drain(void);
 
 	ENET_API uint32_t enet_host_get_peers_count(const ENetHost*);
@@ -1068,77 +1086,483 @@ extern "C" {
 	Buffer pool
 
 	Fixed-size pool of whole packet blocks (ENetPacket header + payload
-	co-allocated, see enet_packet_create). Single-threaded, like the rest
-	of the library: all packet operations must happen on one thread.
+	co-allocated, see enet_packet_create).
+
+	Thread safety, lock-free: every thread owns a private cache, a fixed
+	array of block pointers used as a stack, so acquiring or releasing a
+	block is an index move that touches no shared state, takes no lock and
+	performs no atomic read-modify-write. Hosts may be serviced
+	on different threads, and a packet may be destroyed on another thread
+	than the one that created it: its block simply joins the releasing
+	thread's cache. Statistics are counted per thread and folded into
+	process-wide atomic totals every ENET_POOL_STATS_BATCH operations, and
+	whenever a thread reads statistics or drains, so a reader sees other
+	threads' latest operations with a short delay.
+
+	When a thread exits, its cached blocks are parked on a process-wide
+	orphan stack and adopted by the next thread whose cache runs dry, or
+	freed by enet_pool_drain / enet_deinitialize. The orphan stack only
+	supports pushing a chain (CAS) and taking the whole stack (exchange),
+	which is immune to ABA. The exit hook is a pthread key destructor on
+	POSIX and DLL_THREAD_DETACH in the Windows DLL built with MSVC or
+	clang-cl. Windows static builds and MinGW builds (whose __thread is
+	emulated and torn down before DllMain runs) have no hook, so their
+	threads should call enet_pool_drain before exiting; otherwise up to
+	ENET_POOL_MAX_RETAINED blocks per exited thread stay allocated until
+	the process ends. Define ENET_NO_DLLMAIN to leave DllMain out of a DLL
+	that brings its own.
+
+	Define ENET_NO_POOL to compile the pool out: every packet then goes
+	through enet_malloc / enet_free, exactly as before the pool existed.
 
 =======================================================================
 */
 
-	/* Whole-block size: the ENetPacket header (~40 bytes on 64-bit) is co-allocated with the payload,
-	   so the pooled payload ceiling is ENET_POOL_BLOCK_SIZE - sizeof(ENetPacket) (~1240 on 64-bit).
-	   1280 comfortably covers game/MTU-class payloads (1024-1200); raise it to cover the full MTU. */
-	#define ENET_POOL_BLOCK_SIZE   1280
-	#define ENET_POOL_MAX_RETAINED 576
+	/* Whole-block size: the ENetPacket header (40 bytes on 64-bit, 24 on 32-bit) is co-allocated with the
+	   payload, so the pooled payload ceiling is ENET_POOL_BLOCK_SIZE - sizeof(ENetPacket): 1248 bytes on
+	   64-bit. At the default 1280-byte MTU, enet_peer_send fragments payloads above 1244 bytes, so every
+	   unfragmented packet fits a block; raise it together with the MTU. */
+	#define ENET_POOL_BLOCK_SIZE   1288
+
+	/* Blocks retained per thread cache (~160 KB at the default block size). The busiest thread of the
+	   multi-process stress test peaked at 71 cached blocks; releases beyond the cap go to the allocator. */
+	#define ENET_POOL_MAX_RETAINED 128
+
+#ifndef ENET_NO_POOL
+	/* Operations a thread counts locally before folding them into the process-wide totals */
+	#ifndef ENET_POOL_STATS_BATCH
+		#define ENET_POOL_STATS_BATCH 64
+	#endif
+
+	#ifdef _MSC_VER
+		/* Aligned volatile loads are single plain loads with acquire semantics on x86/x64 (/volatile:ms).
+		   ENET_ATOMIC_READ would be a locked read-modify-write that bounces the cache line between threads. */
+		#define ENET_POOL_LOAD_FLAG(variable) (*(volatile const int*)(variable))
+		#define ENET_POOL_LOAD_POINTER(variable) (*(void* volatile const*)(variable))
+		#define ENET_POOL_EXCHANGE_POINTER(variable, value) InterlockedExchangePointer((void* volatile*)(variable), (value))
+	#else
+		#define ENET_POOL_LOAD_FLAG(variable) __atomic_load_n((variable), __ATOMIC_ACQUIRE)
+		#define ENET_POOL_LOAD_POINTER(variable) __atomic_load_n((variable), __ATOMIC_ACQUIRE)
+		#define ENET_POOL_EXCHANGE_POINTER(variable, value) __atomic_exchange_n((variable), (value), __ATOMIC_ACQ_REL)
+	#endif
 
 	typedef struct _ENetPoolBlock {
 		struct _ENetPoolBlock* next;
 	} ENetPoolBlock;
 
-	static ENetPoolBlock* enet_pool_free_list = NULL;
-	static uint32_t enet_pool_retained = 0;
-	static int enet_pool_enabled = 0;
-	static uint64_t enet_pool_stat_hits = 0;
-	static uint64_t enet_pool_stat_misses = 0;
-	static uint64_t enet_pool_stat_oversized = 0;
-	static uint64_t enet_pool_stat_returned = 0;
+	#define ENET_POOL_CACHE_LINE 64
 
-#ifndef ENET_NO_POOL
+	/* Owned by exactly one thread; nothing here is ever touched by another thread. The padding keeps two
+	   threads' caches (adjacent TLS blocks or heap allocations) from sharing a cache line. */
+	typedef struct _ENetPoolCache {
+		char leadingPadding[ENET_POOL_CACHE_LINE];
+		uint32_t retained;
+		uint32_t pendingOperations;
+		uint32_t pendingHits;
+		uint32_t pendingMisses;
+		uint32_t pendingOversized;
+		uint32_t pendingReturned;
+		uint32_t pendingFreed;
+		int32_t pendingRetained;
+		int active;
+		ENetPoolBlock* slots[ENET_POOL_MAX_RETAINED]; /* free blocks; slots[retained - 1] is the top */
+		char trailingPadding[ENET_POOL_CACHE_LINE];
+	} ENetPoolCache;
+
+	/* Process-wide state, one cache line per role. The enabled flag is read by every operation and changes
+	   only in enet_initialize / enet_deinitialize; the orphan stack changes only through push (CAS) and
+	   take-all (exchange); the totals take every thread's batched flushes through atomics. On a shared line,
+	   each flush would evict the flag from every other core. */
+	static struct {
+		char leadingPadding[ENET_POOL_CACHE_LINE];
+		int enabled;
+		char enabledPadding[ENET_POOL_CACHE_LINE];
+		ENetPoolBlock* orphans;
+		char orphansPadding[ENET_POOL_CACHE_LINE];
+		uint64_t hits;
+		uint64_t misses;
+		uint64_t oversized;
+		uint64_t returned;
+		uint64_t freed;
+		uint64_t drained;
+		int64_t retained;
+		uint64_t orphaned;
+		uint64_t caches;
+		char trailingPadding[ENET_POOL_CACHE_LINE];
+	} enet_pool_shared;
+
+	static void enet_pool_flush(ENetPoolCache* cache) {
+		if (cache->pendingHits != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.hits, cache->pendingHits);
+
+		if (cache->pendingMisses != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.misses, cache->pendingMisses);
+
+		if (cache->pendingOversized != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.oversized, cache->pendingOversized);
+
+		if (cache->pendingReturned != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.returned, cache->pendingReturned);
+
+		if (cache->pendingFreed != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.freed, cache->pendingFreed);
+
+		if (cache->pendingRetained != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.retained, (int64_t)cache->pendingRetained);
+
+		cache->pendingOperations = 0;
+		cache->pendingHits = 0;
+		cache->pendingMisses = 0;
+		cache->pendingOversized = 0;
+		cache->pendingReturned = 0;
+		cache->pendingFreed = 0;
+		cache->pendingRetained = 0;
+	}
+
+	#define ENET_POOL_COUNT(cache) do { if (++(cache)->pendingOperations >= ENET_POOL_STATS_BATCH) enet_pool_flush(cache); } while (0)
+
+	static void enet_pool_orphans_push(ENetPoolBlock* first, ENetPoolBlock* last) {
+		ENetPoolBlock* head = (ENetPoolBlock*)ENET_POOL_LOAD_POINTER(&enet_pool_shared.orphans);
+
+		/* Push only links our own chain in front of whatever head we observed, so a head that was taken
+		   and pushed again in between (ABA) is still a correct successor */
+		for (;;) {
+			last->next = head;
+
+			#ifdef _MSC_VER
+				ENetPoolBlock* observed = (ENetPoolBlock*)InterlockedCompareExchangePointer((void* volatile*)&enet_pool_shared.orphans, first, head);
+
+				if (observed == head)
+					return;
+
+				head = observed;
+			#else
+				if (__atomic_compare_exchange_n(&enet_pool_shared.orphans, &head, first, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+					return;
+			#endif
+		}
+	}
+
+	/* A thread is going away: park its blocks for adoption (still counted as retained) and publish its counts */
+	static void enet_pool_cache_retire(ENetPoolCache* cache) {
+		if (cache->retained != 0) {
+			uint32_t i;
+
+			/* Parked blocks are linked through their first word, which is free while a block is unused */
+			for (i = 0; i + 1 < cache->retained; i++)
+				cache->slots[i]->next = cache->slots[i + 1];
+
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.orphaned, cache->retained);
+
+			enet_pool_orphans_push(cache->slots[0], cache->slots[cache->retained - 1]);
+
+			cache->retained = 0;
+		}
+
+		enet_pool_flush(cache);
+
+		cache->active = 0;
+
+		ENET_ATOMIC_DEC(&enet_pool_shared.caches);
+	}
+
+	#ifdef _WIN32
+		#ifdef _MSC_VER
+			static __declspec(thread) ENetPoolCache enet_pool_thread_cache;
+		#else
+			static __thread ENetPoolCache enet_pool_thread_cache;
+		#endif
+
+		static int enet_pool_hooks_ready(void) {
+			return 1;
+		}
+
+		static ENetPoolCache* enet_pool_cache_find(void) {
+			return enet_pool_thread_cache.active ? &enet_pool_thread_cache : NULL;
+		}
+
+		static ENetPoolCache* enet_pool_cache_get(void) {
+			ENetPoolCache* cache = &enet_pool_thread_cache;
+
+			if (!cache->active) {
+				cache->active = 1;
+
+				ENET_ATOMIC_INC(&enet_pool_shared.caches);
+			}
+
+			return cache;
+		}
+
+		#if defined(ENET_DLL) && defined(_MSC_VER) && !defined(ENET_NO_DLLMAIN)
+			/* Thread-exit hook: DLL_THREAD_DETACH runs on the exiting thread while its thread-local storage is still valid */
+			BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
+				(void)instance;
+				(void)reserved;
+
+				if (reason == DLL_THREAD_DETACH && enet_pool_thread_cache.active)
+					enet_pool_cache_retire(&enet_pool_thread_cache);
+
+				return TRUE;
+			}
+		#endif
+	#else
+		static pthread_key_t enet_pool_key;
+		static pthread_once_t enet_pool_key_once = PTHREAD_ONCE_INIT;
+		static int enet_pool_key_valid = 0;
+
+		/* Thread-exit hook (pthread key destructor): runs on the exiting thread with its cache */
+		static void enet_pool_thread_exit(void* cache) {
+			enet_pool_cache_retire((ENetPoolCache*)cache);
+
+			free(cache);
+		}
+
+		static void enet_pool_key_create(void) {
+			if (pthread_key_create(&enet_pool_key, enet_pool_thread_exit) == 0)
+				enet_pool_key_valid = 1;
+		}
+
+		static int enet_pool_hooks_ready(void) {
+			pthread_once(&enet_pool_key_once, enet_pool_key_create);
+
+			return enet_pool_key_valid;
+		}
+
+		static ENetPoolCache* enet_pool_cache_find(void) {
+			if (!enet_pool_hooks_ready())
+				return NULL;
+
+			return (ENetPoolCache*)pthread_getspecific(enet_pool_key);
+		}
+
+		static ENetPoolCache* enet_pool_cache_get(void) {
+			/* The key exists: the pool is only enabled after enet_pool_hooks_ready succeeded */
+			ENetPoolCache* cache = (ENetPoolCache*)pthread_getspecific(enet_pool_key);
+
+			if (cache != NULL)
+				return cache;
+
+			/* Plain calloc/free rather than the user callbacks: the cache is freed by the thread-exit
+			   hook, where calling back into a managed allocator is not safe */
+			cache = (ENetPoolCache*)calloc(1, sizeof(ENetPoolCache));
+
+			if (cache == NULL)
+				return NULL;
+
+			if (pthread_setspecific(enet_pool_key, cache) != 0) {
+				free(cache);
+
+				return NULL;
+			}
+
+			cache->active = 1;
+
+			ENET_ATOMIC_INC(&enet_pool_shared.caches);
+
+			return cache;
+		}
+
+		#if defined(__GNUC__) || defined(__clang__)
+			/* On dlclose the key destructor would point into unmapped code for threads that outlive the
+			   library, so delete the key (their caches then just stay allocated) and stop pooling */
+			__attribute__((destructor)) static void enet_pool_unload(void) {
+				if (enet_pool_key_valid) {
+					ENET_ATOMIC_WRITE(&enet_pool_shared.enabled, 0);
+
+					enet_pool_key_valid = 0;
+
+					pthread_key_delete(enet_pool_key);
+				}
+			}
+		#endif
+	#endif
+
+	/* Cold path, taken only when the calling thread's cache is empty: refills it from the parked blocks */
+	static void enet_pool_adopt_orphans(ENetPoolCache* cache) {
+		ENetPoolBlock* chain;
+		uint32_t kept = 0, trimmed = 0;
+
+		/* A plain read first, so a miss does not take the shared cache line exclusive */
+		if (ENET_POOL_LOAD_POINTER(&enet_pool_shared.orphans) == NULL)
+			return;
+
+		chain = (ENetPoolBlock*)ENET_POOL_EXCHANGE_POINTER(&enet_pool_shared.orphans, NULL);
+
+		while (chain != NULL) {
+			ENetPoolBlock* next = chain->next;
+
+			if (cache->retained < ENET_POOL_MAX_RETAINED) {
+				cache->slots[cache->retained++] = chain;
+				++kept;
+			} else {
+				enet_free(chain);
+				++trimmed;
+			}
+
+			chain = next;
+		}
+
+		if (kept + trimmed != 0)
+			ENET_ATOMIC_DEC_BY(&enet_pool_shared.orphaned, (int64_t)kept + trimmed);
+
+		/* The kept blocks were already in the retained total as orphans */
+		if (trimmed != 0) {
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.drained, (uint64_t)trimmed);
+			ENET_ATOMIC_DEC_BY(&enet_pool_shared.retained, (int64_t)trimmed);
+		}
+	}
+
 	static void* enet_pool_acquire(size_t size, int* pooled) {
-		void* block;
+		ENetPoolCache* cache;
+		ENetPoolBlock* block;
 
 		*pooled = 0;
 
-		if (!enet_pool_enabled)
+		if (!ENET_POOL_LOAD_FLAG(&enet_pool_shared.enabled))
+			return enet_malloc(size);
+
+		cache = enet_pool_cache_get();
+
+		if (cache == NULL)
 			return enet_malloc(size);
 
 		if (size > ENET_POOL_BLOCK_SIZE) {
-			++enet_pool_stat_oversized;
+			++cache->pendingOversized;
+
+			ENET_POOL_COUNT(cache);
 
 			return enet_malloc(size);
 		}
 
-		if (enet_pool_free_list != NULL) {
-			block = enet_pool_free_list;
-			enet_pool_free_list = enet_pool_free_list->next;
-			--enet_pool_retained;
-			++enet_pool_stat_hits;
+		if (cache->retained == 0)
+			enet_pool_adopt_orphans(cache);
+
+		if (cache->retained != 0) {
+			block = cache->slots[--cache->retained];
+			--cache->pendingRetained;
+			++cache->pendingHits;
+
+			ENET_POOL_COUNT(cache);
+
 			*pooled = 1;
 
 			return block;
 		}
 
-		++enet_pool_stat_misses;
+		/* No warm-up: a full-size block is allocated on demand and joins a cache when released */
+		block = (ENetPoolBlock*)enet_malloc(ENET_POOL_BLOCK_SIZE);
 
-		/* No warm-up: a full-size block is allocated on demand and joins the pool when released */
-		block = enet_malloc(ENET_POOL_BLOCK_SIZE);
+		if (block != NULL) {
+			++cache->pendingMisses;
 
-		if (block != NULL)
+			ENET_POOL_COUNT(cache);
+
 			*pooled = 1;
+		}
 
 		return block;
 	}
 
 	static void enet_pool_release(void* block) {
-		if (enet_pool_enabled && enet_pool_retained < ENET_POOL_MAX_RETAINED) {
-			((ENetPoolBlock*)block)->next = enet_pool_free_list;
-			enet_pool_free_list = (ENetPoolBlock*)block;
-			++enet_pool_retained;
-			++enet_pool_stat_returned;
+		ENetPoolCache* cache = NULL;
 
-			return;
+		if (ENET_POOL_LOAD_FLAG(&enet_pool_shared.enabled))
+			cache = enet_pool_cache_get();
+
+		if (cache != NULL) {
+			if (cache->retained < ENET_POOL_MAX_RETAINED) {
+				cache->slots[cache->retained++] = (ENetPoolBlock*)block;
+				++cache->pendingRetained;
+				++cache->pendingReturned;
+
+				ENET_POOL_COUNT(cache);
+
+				return;
+			}
+
+			++cache->pendingFreed;
+
+			ENET_POOL_COUNT(cache);
+		} else {
+			/* Pool disabled (a packet held past enet_deinitialize) or no cache available */
+			ENET_ATOMIC_INC(&enet_pool_shared.freed);
 		}
 
 		enet_free(block);
+	}
+
+	/* Frees the calling thread's cache and every orphaned block; other live threads keep their caches */
+	static void enet_pool_drain_blocks(void) {
+		ENetPoolCache* cache = enet_pool_cache_find();
+		ENetPoolBlock* block;
+		uint64_t drained = 0, orphans = 0;
+
+		if (cache != NULL) {
+			uint32_t i;
+
+			for (i = 0; i < cache->retained; i++)
+				enet_free(cache->slots[i]);
+
+			drained = cache->retained;
+			cache->pendingRetained -= (int32_t)cache->retained;
+			cache->retained = 0;
+
+			enet_pool_flush(cache);
+		}
+
+		block = (ENetPoolBlock*)ENET_POOL_EXCHANGE_POINTER(&enet_pool_shared.orphans, NULL);
+
+		while (block != NULL) {
+			ENetPoolBlock* next = block->next;
+
+			enet_free(block);
+
+			block = next;
+			++orphans;
+		}
+
+		if (orphans != 0) {
+			ENET_ATOMIC_DEC_BY(&enet_pool_shared.orphaned, (int64_t)orphans);
+			ENET_ATOMIC_DEC_BY(&enet_pool_shared.retained, (int64_t)orphans);
+		}
+
+		if (drained + orphans != 0)
+			ENET_ATOMIC_INC_BY(&enet_pool_shared.drained, drained + orphans);
+	}
+
+	static void enet_pool_read_statistics(ENetPoolStatistics* statistics) {
+		ENetPoolCache* cache = enet_pool_cache_find();
+		int64_t retained;
+
+		/* Publish the calling thread's pending counts, so a single-threaded caller always reads exact values */
+		if (cache != NULL)
+			enet_pool_flush(cache);
+
+		retained = (int64_t)ENET_ATOMIC_READ(&enet_pool_shared.retained);
+
+		statistics->hits = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.hits);
+		statistics->misses = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.misses);
+		statistics->oversized = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.oversized);
+		statistics->returned = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.returned);
+		statistics->freed = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.freed);
+		statistics->drained = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.drained);
+		/* Can dip below zero for a moment while other threads' counts are still pending */
+		statistics->retained = retained > 0 ? (uint64_t)retained : 0;
+		statistics->threadRetained = cache != NULL ? cache->retained : 0;
+		statistics->orphaned = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.orphaned);
+		statistics->caches = (uint64_t)ENET_ATOMIC_READ(&enet_pool_shared.caches);
+	}
+
+	/* Counters are process-lifetime totals and are not reset: other threads' caches may still hold blocks */
+	static void enet_pool_startup(void) {
+		if (enet_pool_hooks_ready())
+			ENET_ATOMIC_WRITE(&enet_pool_shared.enabled, 1);
+	}
+
+	static void enet_pool_shutdown(void) {
+		ENET_ATOMIC_WRITE(&enet_pool_shared.enabled, 0);
+
+		enet_pool_drain_blocks();
 	}
 #else
 	static void* enet_pool_acquire(size_t size, int* pooled) {
@@ -1150,35 +1574,20 @@ extern "C" {
 	static void enet_pool_release(void* block) {
 		enet_free(block);
 	}
-#endif // ENET_NO_POOL
 
-	static void enet_pool_free_blocks(void) {
-		ENetPoolBlock* block = enet_pool_free_list;
+	static void enet_pool_drain_blocks(void) {
+	}
 
-		enet_pool_free_list = NULL;
-		enet_pool_retained = 0;
-
-		while (block != NULL) {
-			ENetPoolBlock* next = block->next;
-
-			enet_free(block);
-
-			block = next;
-		}
+	static void enet_pool_read_statistics(ENetPoolStatistics* statistics) {
+		memset(statistics, 0, sizeof(ENetPoolStatistics));
 	}
 
 	static void enet_pool_startup(void) {
-		enet_pool_enabled = 1;
-		enet_pool_stat_hits = 0;
-		enet_pool_stat_misses = 0;
-		enet_pool_stat_oversized = 0;
-		enet_pool_stat_returned = 0;
 	}
 
 	static void enet_pool_shutdown(void) {
-		enet_pool_enabled = 0;
-		enet_pool_free_blocks();
 	}
+#endif // ENET_NO_POOL
 
 /*
 =======================================================================
@@ -1266,67 +1675,20 @@ extern "C" {
 */
 
 	#ifdef _WIN32
-		static LARGE_INTEGER gettime_offset(void) {
-			SYSTEMTIME s;
-			FILETIME f;
-			LARGE_INTEGER t;
-			s.wYear = 1970;
-			s.wMonth = 1;
-			s.wDay = 1;
-			s.wHour = 0;
-			s.wMinute = 0;
-			s.wSecond = 0;
-			s.wMilliseconds = 0;
-
-			SystemTimeToFileTime(&s, &f);
-
-			t.QuadPart = f.dwHighDateTime;
-			t.QuadPart <<= 32;
-			t.QuadPart |= f.dwLowDateTime;
-
-			return t;
-		}
-
+		/* Stateless on purpose: hosts may be serviced on several threads, and the lazily initialized statics
+		   this used to keep raced (a thread could see "initialized" before the frequency was stored and divide
+		   by zero). QueryPerformanceFrequency cannot fail on Windows XP or later, and enet_time_get applies
+		   its own start offset. */
 		int clock_gettime(int X, struct timespec* tv) {
-			LARGE_INTEGER t;
-			FILETIME f;
-			double microseconds;
+			LARGE_INTEGER frequency, counter;
 
-			static LARGE_INTEGER offset;
-			static double frequencyToMicroseconds;
-			static int initialized = 0;
-			static BOOL usePerformanceCounter = 0;
+			(void)X;
 
-			if (!initialized) {
-				LARGE_INTEGER performanceFrequency;
-				initialized = 1;
-				usePerformanceCounter = QueryPerformanceFrequency(&performanceFrequency);
+			QueryPerformanceFrequency(&frequency);
+			QueryPerformanceCounter(&counter);
 
-				if (usePerformanceCounter) {
-					QueryPerformanceCounter(&offset);
-
-					frequencyToMicroseconds = (double)performanceFrequency.QuadPart / 1000000.;
-				} else {
-					offset = gettime_offset();
-					frequencyToMicroseconds = 10.;
-				}
-			}
-
-			if (usePerformanceCounter) {
-				QueryPerformanceCounter(&t);
-			} else {
-				GetSystemTimeAsFileTime(&f);
-
-				t.QuadPart = f.dwHighDateTime;
-				t.QuadPart <<= 32;
-				t.QuadPart |= f.dwLowDateTime;
-			}
-
-			t.QuadPart -= offset.QuadPart;
-			microseconds = (double)t.QuadPart / frequencyToMicroseconds;
-			t.QuadPart = (LONGLONG)microseconds;
-			tv->tv_sec = (long)(t.QuadPart / 1000000);
-			tv->tv_nsec = t.QuadPart % 1000000 * 1000;
+			tv->tv_sec = (long)(counter.QuadPart / frequency.QuadPart);
+			tv->tv_nsec = (long)((counter.QuadPart % frequency.QuadPart) * 1000000000 / frequency.QuadPart);
 
 			return 0;
 		}
@@ -5234,24 +5596,41 @@ extern "C" {
 	}
 
 	void enet_pool_get_statistics(uint64_t* hits, uint64_t* misses, uint64_t* oversized, uint64_t* returned, uint32_t* retained) {
+		ENetPoolStatistics statistics;
+
+		enet_pool_read_statistics(&statistics);
+
 		if (hits != NULL)
-			*hits = enet_pool_stat_hits;
+			*hits = statistics.hits;
 
 		if (misses != NULL)
-			*misses = enet_pool_stat_misses;
+			*misses = statistics.misses;
 
 		if (oversized != NULL)
-			*oversized = enet_pool_stat_oversized;
+			*oversized = statistics.oversized;
 
 		if (returned != NULL)
-			*returned = enet_pool_stat_returned;
+			*returned = statistics.returned;
 
 		if (retained != NULL)
-			*retained = enet_pool_retained;
+			*retained = (uint32_t)statistics.retained;
+	}
+
+	void enet_pool_get_statistics_ex(ENetPoolStatistics* statistics) {
+		if (statistics != NULL)
+			enet_pool_read_statistics(statistics);
+	}
+
+	uint32_t enet_pool_get_block_size(void) {
+		#ifdef ENET_NO_POOL
+			return 0;
+		#else
+			return ENET_POOL_BLOCK_SIZE;
+		#endif
 	}
 
 	void enet_pool_drain(void) {
-		enet_pool_free_blocks();
+		enet_pool_drain_blocks();
 	}
 
 	uint32_t enet_host_get_peers_count(const ENetHost* host) {
